@@ -1310,7 +1310,10 @@ struct ContentView: View {
         }
         // Only the menu bar window counts, not Reports or other windows
         .background(WindowReader { window in
-            if let window { hostWindow = window }
+            if let window {
+                hostWindow = window
+                menuBarWindow = window
+            }
         })
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             guard isHostWindow(note) else { return }
@@ -1328,12 +1331,16 @@ struct ContentView: View {
     }
 }
 
+// The menu bar window, so it can be closed when Reports opens
+weak var menuBarWindow: NSWindow?
+
 // Opens Reports, or brings it back to the front if it is already open
-// (behind other apps, or minimized)
+// (behind other apps, or minimized), and closes the menu bar window
 func showReportsWindow(_ openWindow: OpenWindowAction) {
     NSApp.activate(ignoringOtherApps: true)
     openWindow(id: "reports")
     DispatchQueue.main.async {
+        menuBarWindow?.close()
         guard let window = NSApp.windows.first(where: isReportsWindow) else { return }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
