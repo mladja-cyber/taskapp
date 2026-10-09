@@ -2340,8 +2340,11 @@ struct TaskDetailView: View {
             currentCard(task, now: now)
             partsList(task, now: now)
             actions(task)
-            if showReportButton {
-                reportButton
+            HStack(spacing: 8) {
+                if showReportButton {
+                    reportButton
+                }
+                adjustButton(task)
             }
             Divider()
             footer(task)
@@ -2616,6 +2619,22 @@ struct TaskDetailView: View {
         .help("Time by part, by day, and every work session")
     }
 
+    // Forgot the timer, or left it running? Add or remove time by hand
+    private func adjustButton(_ task: TaskItem) -> some View {
+        Button {
+            adjusting = true
+        } label: {
+            Label("Adjust Time", systemImage: "plusminus.circle")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .help("Add or remove time on any part")
+        .popover(isPresented: $adjusting, arrowEdge: .bottom) {
+            AdjustTimeView(task: task) { adjusting = false }
+                .environmentObject(store)
+        }
+    }
+
     private func footer(_ task: TaskItem) -> some View {
         HStack(spacing: 14) {
             if let undo = store.undoStepTitle(task) {
@@ -2626,16 +2645,6 @@ struct TaskDetailView: View {
                 }
             }
             Spacer()
-            Button {
-                adjusting = true
-            } label: {
-                Image(systemName: "clock.badge.plus")
-            }
-            .help("Add or remove time (forgot the timer?)")
-            .popover(isPresented: $adjusting, arrowEdge: .bottom) {
-                AdjustTimeView(task: task) { adjusting = false }
-                    .environmentObject(store)
-            }
             if task.status != .done {
                 Button {
                     store.markDone(task)
@@ -3372,12 +3381,16 @@ struct ReportsView: View {
         store.tasks.contains { $0.isRunning } ? 1 : 60
     }
 
+    // Laid out by hand (sidebar | month | task panel): the system split view and
+    // inspector cut the panel off and crashed when the window was resized
     var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             // Updates whenever the tasks change
             sidebar(MonthSummary(tasks: store.tasks, month: month, client: nil, now: Date()))
-                .navigationSplitViewColumnWidth(240)   // fixed: dragging it broke the layout
-        } detail: {
+                .frame(width: 230)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .background(Color.primary.opacity(0.03))
+            Divider()
             LiveView(every: refresh) { now in
                 if search.trimmingCharacters(in: .whitespaces).isEmpty {
                     MonthDashboard(
@@ -3394,24 +3407,14 @@ struct ReportsView: View {
                     SearchResultsView(query: search, now: now, selectedTaskID: $selectedTaskID)
                 }
             }
-            .inspector(isPresented: Binding(get: { selectedTaskID != nil },
-                                            set: { if !$0 { selectedTaskID = nil } })) {
-                if let id = selectedTaskID {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            TaskDetailView(taskID: id, day: Calendar.current.startOfDay(for: Date()),
-                                           showReportButton: false) {
-                                selectedTaskID = nil
-                            }
-                            Divider().padding(.horizontal, 16)
-                            TaskStatsView(taskID: id)
-                        }
-                    }
-                    .inspectorColumnWidth(min: 340, ideal: 350, max: 420)
-                }
+            .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
+            if let id = selectedTaskID {
+                Divider()
+                taskPanel(id)
+                    .frame(width: 344)
+                    .frame(maxHeight: .infinity, alignment: .top)
             }
         }
-        .searchable(text: $search, placement: .toolbar, prompt: "Search tasks or clients")
         // Opened from "Task Report" on a task card in the menu bar
         .onAppear(perform: showRequestedTask)
         .onChange(of: store.reportTaskID) { _, _ in showRequestedTask() }
@@ -3428,13 +3431,67 @@ struct ReportsView: View {
             }
         }
         .toolbar { backupButtons }
-        .frame(minWidth: 1100, minHeight: 620)
+        .frame(minWidth: 1100, minHeight: 640)
         // While Reports is open the app shows in the Dock and in Cmd+Tab, so the window
         // is easy to get back to after clicking somewhere else
         .onAppear { NSApp.setActivationPolicy(.regular) }
         .onDisappear {
             NSApp.setActivationPolicy(.accessory)
         }
+    }
+
+    // The selected task: its card (with all the buttons) and its full statistics
+    private func taskPanel(_ id: UUID) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Task Report")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    selectedTaskID = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Close")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    TaskDetailView(taskID: id, day: Calendar.current.startOfDay(for: Date()),
+                                   showReportButton: false) {
+                        selectedTaskID = nil
+                    }
+                    Divider().padding(.horizontal, 16)
+                    TaskStatsView(taskID: id)
+                }
+            }
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search tasks or clients", text: $search)
+                .textFieldStyle(.plain)
+            if !search.isEmpty {
+                Button {
+                    search = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func sidebar(_ all: MonthSummary) -> some View {
@@ -3447,6 +3504,8 @@ struct ReportsView: View {
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 2) {
+                searchField
+                    .padding(.bottom, 14)
                 sidebarHeader(month.formatted(.dateTime.month(.wide).year().locale(appLocale)))
                 SidebarRow(title: "All Clients", icon: "square.grid.2x2",
                            value: all.total > 0 ? formatDuration(all.total) : "–",
