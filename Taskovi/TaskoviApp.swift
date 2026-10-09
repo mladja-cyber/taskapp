@@ -998,6 +998,19 @@ struct ContentView: View {
     @State private var lastActive = Date()
     @State private var hostWindow: NSWindow?
 
+    // Opens Reports, or brings it back to the front if it is already open
+    // (behind other apps, or minimized)
+    private func showReports() {
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "reports")
+        DispatchQueue.main.async {
+            guard let window = NSApp.windows.first(where: isReportsWindow) else { return }
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+        }
+    }
+
     // Opening the app after 2+ minutes away always starts on today
     private func windowBecameActive() {
         refreshToday()
@@ -1037,8 +1050,7 @@ struct ContentView: View {
 
             HStack {
                 Button {
-                    openWindow(id: "reports")
-                    NSApp.activate(ignoringOtherApps: true)
+                    showReports()
                 } label: {
                     Label("Reports", systemImage: "chart.bar")
                 }
@@ -1110,6 +1122,11 @@ struct ContentView: View {
         guard let window = note.object as? NSWindow, let hostWindow else { return false }
         return window === hostWindow
     }
+}
+
+// The Reports window (SwiftUI names it after the scene id "reports")
+func isReportsWindow(_ window: NSWindow) -> Bool {
+    window.identifier?.rawValue.hasPrefix("reports") == true || window.title == "Reports"
 }
 
 // Reports the window a SwiftUI view is shown in
@@ -2919,6 +2936,12 @@ struct ReportsView: View {
         }
         .toolbar { backupButtons }
         .frame(minWidth: 1100, minHeight: 620)
+        // While Reports is open the app shows in the Dock and in Cmd+Tab, so the window
+        // is easy to get back to after clicking somewhere else
+        .onAppear { NSApp.setActivationPolicy(.regular) }
+        .onDisappear {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     private func sidebar(_ all: MonthSummary) -> some View {
@@ -3609,6 +3632,15 @@ struct TaskoviApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    // Clicking the Dock icon (shown while Reports is open) brings Reports to the front
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let window = NSApp.windows.first(where: isReportsWindow), window.isVisible || window.isMiniaturized {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        }
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // No Dock icon, menu bar only
         NSApp.setActivationPolicy(.accessory)
