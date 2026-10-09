@@ -109,10 +109,20 @@ enum TaskStatus: String, Codable, CaseIterable {
 
 // The parts of a task, in order:
 // Body → Revision 1, 2… → (approved) → Hooks → Hooks revision 1, 2… → (approved) → Done
-enum StageKind: String, Codable {
+enum StageKind: String, Codable, CaseIterable {
     case body, bodyFix, hooks, hooksFix
 
     var isBodyPart: Bool { self == .body || self == .bodyFix }
+
+    // Name for all parts of this kind together, used in reports
+    var groupTitle: String {
+        switch self {
+        case .body: return "Body"
+        case .bodyFix: return "Body revisions"
+        case .hooks: return "Hooks"
+        case .hooksFix: return "Hooks revisions"
+        }
+    }
 }
 
 enum StageState: String, Codable {
@@ -226,6 +236,27 @@ struct TaskItem: Identifiable, Codable, Equatable {
         return stage.state == .sent ? "\(stage.title) sent" : stage.title
     }
 
+    // Whole days since the current part was sent for review (nil when not waiting)
+    var daysWaiting: Int? {
+        guard isAwaitingReview, let sent = currentStage?.sentAt else { return nil }
+        let cal = Calendar.current
+        return cal.dateComponents([.day], from: cal.startOfDay(for: sent), to: cal.startOfDay(for: Date())).day
+    }
+
+    // "waiting 3 days" — blue at first, orange after 2 days, red after 4
+    var waitingText: String? {
+        guard let days = daysWaiting, days > 0 else { return nil }
+        return days == 1 ? "waiting 1 day" : "waiting \(days) days"
+    }
+
+    var waitingColor: Color {
+        switch daysWaiting ?? 0 {
+        case ..<2: return .blue
+        case 2..<4: return .orange
+        default: return .red
+        }
+    }
+
     var progressIcon: String {
         if status == .done { return "checkmark.circle.fill" }
         if isAwaitingReview { return "paperplane.circle.fill" }
@@ -241,6 +272,20 @@ struct TaskItem: Identifiable, Codable, Equatable {
     // The part a work session belongs to (time from before parts existed counts as the first part)
     private func stageID(of session: WorkSession) -> UUID? {
         session.stageID ?? stages?.first?.id
+    }
+
+    func stageTitle(of session: WorkSession) -> String {
+        let id = stageID(of: session)
+        return stages?.first { $0.id == id }?.title ?? ""
+    }
+
+    // Time per kind of part: all body revisions together, all hooks revisions together…
+    func timeByKind(now: Date = Date()) -> [StageKind: TimeInterval] {
+        var result: [StageKind: TimeInterval] = [:]
+        for stage in stages ?? [] {
+            result[stage.kind, default: 0] += time(of: stage, now: now)
+        }
+        return result
     }
 
     // Total time worked on one part
@@ -330,6 +375,7 @@ struct WorkSession: Identifiable, Codable, Equatable {
     var start: Date
     var end: Date
     var stageID: UUID? = nil   // the part of the task this time was spent on
+    var manual: Bool? = nil    // added by hand with "Adjust Time"
     var duration: TimeInterval { end.timeIntervalSince(start) }
 }
 
@@ -379,8 +425,24 @@ final class TaskStore: ObservableObject {
             workspace.publisher(for: NSWorkspace.willPowerOffNotification),
             NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
         )
-        .sink { [weak self] _ in self?.pauseAll() }
+        .sink { [weak self] _ in
+            self?.pauseAll()
+            self?.autoBackup()
+        }
         .store(in: &cancellables)
+
+        // Notice when you were away from the Mac while a timer kept running
+        Timer.publish(every: 20, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.checkAway() }
+            .store(in: &cancellables)
+
+        // Automatic backup: shortly after launch, then every hour
+        Timer.publish(every: 3600, on: .main, in: .common)
+            .autoconnect()
+            .merge(with: Just(Date()).delay(for: .seconds(30), scheduler: RunLoop.main))
+            .sink { [weak self] _ in self?.autoBackup() }
+            .store(in: &cancellables)
 
         // Keep "today" current after midnight, waking from sleep, or a clock change,
         // so the open-task count in the menu bar moves to the new day on its own
@@ -650,17 +712,55 @@ final class TaskStore: ObservableObject {
         panel.nameFieldStringValue = "Taskovi Backup \(day).json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        let backup = Backup(version: 1, exportedAt: Date(), tasks: tasks, clients: clients)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
         do {
-            try encoder.encode(backup).write(to: url, options: .atomic)
+            try backupData().write(to: url, options: .atomic)
             showAlert("Backup saved",
                       "\(tasks.count) tasks and \(clients.count) clients were saved to \(url.lastPathComponent).")
         } catch {
             showAlert("Couldn't save the backup", error.localizedDescription)
         }
+    }
+
+    private func backupData() throws -> Data {
+        let backup = Backup(version: 1, exportedAt: Date(), tasks: tasks, clients: clients)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(backup)
+    }
+
+    // ~/Library/Application Support/Taskovi/Backups
+    static var backupsFolder: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Taskovi/Backups", isDirectory: true)
+    }
+
+    // One backup file per day (updated through the day), the newest 30 days are kept
+    func autoBackup() {
+        let fm = FileManager.default
+        guard let folder = Self.backupsFolder,
+              !(tasks.isEmpty && clients.isEmpty) else { return }   // never replace a backup with nothing
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            let day = Date().formatted(.iso8601.year().month().day())
+            try backupData().write(to: folder.appendingPathComponent("Taskovi Backup \(day).json"), options: .atomic)
+
+            let files = try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent.hasPrefix("Taskovi Backup ") && $0.pathExtension == "json" }
+                .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            for old in files.dropFirst(30) {
+                try? fm.removeItem(at: old)
+            }
+        } catch {
+            print("Automatic backup failed: \(error)")
+        }
+    }
+
+    func openBackupsFolder() {
+        guard let folder = Self.backupsFolder else { return }
+        autoBackup()
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(folder)
     }
 
     func importBackup() {
@@ -745,6 +845,119 @@ final class TaskStore: ObservableObject {
             + [WorkSession(start: start, end: end, stageID: tasks[i].currentStage?.id)]
         tasks[i].startedAt = nil
     }
+
+    // MARK: Away from the Mac
+
+    // After this long without using the mouse or keyboard, you count as away
+    private static let awayLimit: TimeInterval = 10 * 60
+    private var awaySince: Date?
+
+    private func checkAway() {
+        guard tasks.contains(where: \.isRunning) else {
+            awaySince = nil
+            return
+        }
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                                                           eventType: CGEventType(rawValue: ~0)!)
+        if idle >= Self.awayLimit {
+            if awaySince == nil { awaySince = Date().addingTimeInterval(-idle) }
+        } else if let since = awaySince {
+            // You're back: ask whether the time away should count
+            awaySince = nil
+            askAboutAwayTime(since: since, back: Date().addingTimeInterval(-idle))
+        }
+    }
+
+    private func askAboutAwayTime(since: Date, back: Date) {
+        guard let task = tasks.first(where: \.isRunning), let started = task.startedAt else { return }
+        let from = max(since, started)
+        let away = back.timeIntervalSince(from)
+        guard away >= 60 else { return }
+
+        let time: (Date) -> String = { $0.formatted(date: .omitted, time: .shortened) }
+        let part = task.currentStage.map { " \u{00B7} \($0.title)" } ?? ""
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "You were away for \(formatDuration(away))"
+        alert.informativeText = "From \(time(from)) to \(time(back)) the timer for \(task.title)\(part) kept running. Should that time count?"
+        alert.addButton(withTitle: "Keep the Time")
+        alert.addButton(withTitle: "Remove It")
+        alert.addButton(withTitle: "Remove It & Stop Timer")
+        let answer = alert.runModal()
+        guard answer != .alertFirstButtonReturn else { return }
+        removeAwayTime(taskID: task.id, from: from, back: back, stop: answer == .alertThirdButtonReturn)
+    }
+
+    // Saves the work up to when you left; the timer continues from when you came back (or stops)
+    private func removeAwayTime(taskID: UUID, from: Date, back: Date, stop: Bool) {
+        guard let i = tasks.firstIndex(where: { $0.id == taskID }), let started = tasks[i].startedAt else { return }
+        let end = max(from, started)
+        if end > started {
+            tasks[i].timeSpent = (tasks[i].timeSpent ?? 0) + end.timeIntervalSince(started)
+            tasks[i].sessions = (tasks[i].sessions ?? [])
+                + [WorkSession(start: started, end: end, stageID: tasks[i].currentStage?.id)]
+        }
+        tasks[i].startedAt = stop ? nil : min(back, Date())
+        updateStatus(at: i)
+    }
+
+    // MARK: Fixing time by hand
+
+    // Adds time to a part (on a chosen day), or takes it off the most recent work on that part
+    func adjustTime(_ task: TaskItem, stageID: UUID, by seconds: TimeInterval, on day: Date) {
+        guard let i = index(of: task), seconds != 0 else { return }
+        let cal = Calendar.current
+        var sessions = tasks[i].sessions ?? []
+
+        if seconds > 0 {
+            // Today: ends now (or where the running timer started); another day: from noon
+            let end = cal.isDateInToday(day)
+                ? (tasks[i].startedAt ?? Date())
+                : (cal.date(bySettingHour: 12, minute: 0, second: 0, of: day) ?? day).addingTimeInterval(seconds)
+            sessions.append(WorkSession(start: end.addingTimeInterval(-seconds), end: end,
+                                        stageID: stageID, manual: true))
+            tasks[i].sessions = sessions
+            tasks[i].timeSpent = (tasks[i].timeSpent ?? 0) + seconds
+        } else {
+            var remaining = -seconds
+            // The running timer is the most recent work
+            if tasks[i].currentStage?.id == stageID, let started = tasks[i].startedAt {
+                let cut = min(remaining, max(0, Date().timeIntervalSince(started)))
+                tasks[i].startedAt = started.addingTimeInterval(cut)
+                remaining -= cut
+            }
+            let first = tasks[i].stages?.first?.id
+            var removed: TimeInterval = 0
+            for k in sessions.indices.sorted(by: { sessions[$0].end > sessions[$1].end }) {
+                if remaining <= 0 { break }
+                guard (sessions[k].stageID ?? first) == stageID else { continue }
+                let cut = min(remaining, sessions[k].duration)
+                sessions[k].end = sessions[k].end.addingTimeInterval(-cut)
+                remaining -= cut
+                removed += cut
+            }
+            tasks[i].sessions = sessions.filter { $0.duration >= 1 }
+            tasks[i].timeSpent = max(0, (tasks[i].timeSpent ?? 0) - removed)
+        }
+        updateStatus(at: i)
+    }
+
+    func confirmDeleteSession(_ task: TaskItem, _ session: WorkSession) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Delete this work session?"
+        alert.informativeText = "\(formatDuration(session.duration)) on \(task.title) will be removed from your time."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let i = index(of: task) else { return }
+        tasks[i].sessions = (tasks[i].sessions ?? []).filter { $0.id != session.id }
+        tasks[i].timeSpent = max(0, (tasks[i].timeSpent ?? 0) - session.duration)
+        updateStatus(at: i)
+    }
+
+    // Task to show when Reports opens from a task card in the menu bar
+    @Published var reportTaskID: UUID?
 
     // Total time spent on all tasks for one client
     func totalTime(for clientName: String) -> TimeInterval {
@@ -998,17 +1211,8 @@ struct ContentView: View {
     @State private var lastActive = Date()
     @State private var hostWindow: NSWindow?
 
-    // Opens Reports, or brings it back to the front if it is already open
-    // (behind other apps, or minimized)
     private func showReports() {
-        NSApp.activate(ignoringOtherApps: true)
-        openWindow(id: "reports")
-        DispatchQueue.main.async {
-            guard let window = NSApp.windows.first(where: isReportsWindow) else { return }
-            if window.isMiniaturized { window.deminiaturize(nil) }
-            window.makeKeyAndOrderFront(nil)
-            window.orderFrontRegardless()
-        }
+        showReportsWindow(openWindow)
     }
 
     // Opening the app after 2+ minutes away always starts on today
@@ -1121,6 +1325,19 @@ struct ContentView: View {
     private func isHostWindow(_ note: Notification) -> Bool {
         guard let window = note.object as? NSWindow, let hostWindow else { return false }
         return window === hostWindow
+    }
+}
+
+// Opens Reports, or brings it back to the front if it is already open
+// (behind other apps, or minimized)
+func showReportsWindow(_ openWindow: OpenWindowAction) {
+    NSApp.activate(ignoringOtherApps: true)
+    openWindow(id: "reports")
+    DispatchQueue.main.async {
+        guard let window = NSApp.windows.first(where: isReportsWindow) else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 }
 
@@ -1773,20 +1990,13 @@ struct TaskRow: View {
             if overdue {
                 Text("Overdue").foregroundStyle(.red)
             }
-            if let sent = sentOnAnotherDay {
-                Text("sent \(sent)").foregroundStyle(.blue)
+            if let waiting = task.waitingText {
+                Text(waiting).foregroundStyle(task.waitingColor)
             }
             timeInfo
                 .layoutPriority(1)
                 .fixedSize()
         }
-    }
-
-    // "Mon, Oct 5" when the task waits for review since another day than the one shown
-    private var sentOnAnotherDay: String? {
-        guard task.isAwaitingReview, let sent = task.currentStage?.sentAt,
-              !Calendar.current.isDate(sent, inSameDayAs: day) else { return nil }
-        return sent.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale))
     }
 
     @ViewBuilder
@@ -2098,9 +2308,12 @@ struct HistoryTaskRow: View {
 struct TaskDetailView: View {
     let taskID: UUID
     let day: Date          // the day shown in Plan
+    var showReportButton = true
     var onClose: () -> Void
     @EnvironmentObject var store: TaskStore
+    @Environment(\.openWindow) private var openWindow
     @State private var editing = false
+    @State private var adjusting = false
 
     var body: some View {
         if let task = store.tasks.first(where: { $0.id == taskID }) {
@@ -2127,6 +2340,9 @@ struct TaskDetailView: View {
             currentCard(task, now: now)
             partsList(task, now: now)
             actions(task)
+            if showReportButton {
+                reportButton
+            }
             Divider()
             footer(task)
         }
@@ -2213,7 +2429,8 @@ struct TaskDetailView: View {
         if task.isAwaitingReview {
             guard let sent = task.currentStage?.sentAt else { return "Waiting for review" }
             let when = sent.formatted(.dateTime.weekday(.abbreviated).hour().minute().locale(appLocale))
-            return "Sent \(when) · waiting for review"
+            let days = task.waitingText.map { " (\($0))" } ?? ""
+            return "Sent \(when) · waiting for review\(days)"
         }
         if task.isRunning { return "Timer running" }
         return partTime > 0 ? "Paused" : "Not started yet"
@@ -2385,6 +2602,20 @@ struct TaskDetailView: View {
 
     // MARK: Small actions
 
+    // Opens Reports with this task's full statistics
+    private var reportButton: some View {
+        Button {
+            store.reportTaskID = taskID
+            onClose()
+            showReportsWindow(openWindow)
+        } label: {
+            Label("Task Report", systemImage: "chart.bar.xaxis")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .help("Time by part, by day, and every work session")
+    }
+
     private func footer(_ task: TaskItem) -> some View {
         HStack(spacing: 14) {
             if let undo = store.undoStepTitle(task) {
@@ -2395,6 +2626,16 @@ struct TaskDetailView: View {
                 }
             }
             Spacer()
+            Button {
+                adjusting = true
+            } label: {
+                Image(systemName: "clock.badge.plus")
+            }
+            .help("Add or remove time (forgot the timer?)")
+            .popover(isPresented: $adjusting, arrowEdge: .bottom) {
+                AdjustTimeView(task: task) { adjusting = false }
+                    .environmentObject(store)
+            }
             if task.status != .done {
                 Button {
                     store.markDone(task)
@@ -2420,6 +2661,222 @@ struct TaskDetailView: View {
         .buttonStyle(.borderless)
         .font(.callout)
         .foregroundStyle(.secondary)
+    }
+}
+
+// "Forgot the timer?" — add time to a part, or take some off
+struct AdjustTimeView: View {
+    let task: TaskItem
+    var onClose: () -> Void
+    @EnvironmentObject var store: TaskStore
+
+    @State private var stageID: UUID
+    @State private var minutes = 30
+    @State private var day = Calendar.current.startOfDay(for: Date())
+
+    init(task: TaskItem, onClose: @escaping () -> Void) {
+        self.task = task
+        self.onClose = onClose
+        _stageID = State(initialValue: task.currentStage?.id ?? task.stages?.first?.id ?? UUID())
+    }
+
+    private var seconds: TimeInterval { TimeInterval(minutes * 60) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Adjust Time").font(.headline)
+
+            Picker("Part", selection: $stageID) {
+                ForEach(task.stages ?? []) { stage in
+                    Text(stage.title).tag(stage.id)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    ForEach([15, 30, 60, 120], id: \.self) { m in
+                        Button(formatDuration(TimeInterval(m * 60))) { minutes = m }
+                            .buttonStyle(.bordered)
+                            .tint(minutes == m ? Color.accentColor : nil)
+                            .controlSize(.small)
+                    }
+                }
+                Stepper(value: $minutes, in: 5...720, step: 5) {
+                    Text(formatDuration(seconds))
+                        .font(.title3.weight(.semibold))
+                        .monospacedDigit()
+                }
+            }
+
+            DatePicker("Day", selection: $day, in: ...Date(), displayedComponents: .date)
+
+            HStack {
+                Button("Remove") {
+                    store.adjustTime(task, stageID: stageID, by: -seconds, on: day)
+                    onClose()
+                }
+                .help("Takes the time off the most recent work on this part")
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button("Add") {
+                    store.adjustTime(task, stageID: stageID, by: seconds, on: day)
+                    onClose()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+
+            Text("Add puts the time on the chosen day. Remove takes it off the most recent work on this part.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+}
+
+// Full statistics for one task (shown in Reports under its card):
+// time by kind of part, time by day, and every work session
+struct TaskStatsView: View {
+    let taskID: UUID
+    @EnvironmentObject var store: TaskStore
+
+    var body: some View {
+        if let task = store.tasks.first(where: { $0.id == taskID }) {
+            LiveView(every: task.isRunning ? 1 : 30) { now in
+                content(task, now: now)
+            }
+        }
+    }
+
+    private func content(_ task: TaskItem, now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            byKind(task, now: now)
+            byDay(task, now: now)
+            sessions(task, now: now)
+        }
+        .padding(16)
+        .frame(width: 310, alignment: .leading)
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    // Body / Body revisions / Hooks / Hooks revisions
+    private func byKind(_ task: TaskItem, now: Date) -> some View {
+        let times = task.timeByKind(now: now)
+        let kinds = StageKind.allCases.filter { times[$0] != nil }
+        let longest = max(times.values.max() ?? 1, 1)
+        let total = times.values.reduce(0, +)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("TIME BY TYPE")
+            ForEach(kinds, id: \.self) { kind in
+                let t = times[kind] ?? 0
+                let count = (task.stages ?? []).filter { $0.kind == kind }.count
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(kind.groupTitle)
+                        if kind == .bodyFix || kind == .hooksFix {
+                            Text("\u{00D7}\(count)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(formatDuration(t))
+                            .monospacedDigit()
+                        Text(total > 0 ? "\(Int((t / total * 100).rounded()))%" : "")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 34, alignment: .trailing)
+                    }
+                    ProgressBar(fraction: t / longest)
+                }
+            }
+        }
+    }
+
+    private func byDay(_ task: TaskItem, now: Date) -> some View {
+        let perDay = task.timePerDay(now: now).filter { $0.value >= 1 }
+        let days = perDay.keys.sorted(by: >)
+
+        return VStack(alignment: .leading, spacing: 6) {
+            sectionTitle("BY DAY")
+            if days.isEmpty {
+                Text("No time tracked yet.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(days, id: \.self) { day in
+                HStack {
+                    Text(Calendar.current.isDateInToday(day) ? "Today"
+                         : day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
+                    Text(task.stageTimes(on: day, now: now).map(\.stage.title).joined(separator: ", "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Text(formatDuration(perDay[day] ?? 0))
+                        .monospacedDigit()
+                }
+            }
+        }
+    }
+
+    // Every start–stop, newest first; a session can be deleted
+    private func sessions(_ task: TaskItem, now: Date) -> some View {
+        let list = (task.sessions ?? []).sorted { $0.start > $1.start }
+
+        return VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("WORK SESSIONS")
+            if let start = task.startedAt {
+                sessionRow(start: start, endText: "now", part: task.currentStage?.title ?? "",
+                           duration: now.timeIntervalSince(start), running: true, manual: false, onDelete: nil)
+            }
+            if list.isEmpty && !task.isRunning {
+                Text(task.elapsed() > 0 ? "This time was tracked before session history was added."
+                                        : "No sessions yet.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(list) { s in
+                sessionRow(start: s.start,
+                           endText: s.end.formatted(date: .omitted, time: .shortened),
+                           part: task.stageTitle(of: s),
+                           duration: s.duration, running: false, manual: s.manual == true) {
+                    store.confirmDeleteSession(task, s)
+                }
+            }
+        }
+    }
+
+    private func sessionRow(start: Date, endText: String, part: String, duration: TimeInterval,
+                            running: Bool, manual: Bool, onDelete: (() -> Void)?) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale))) · \(start.formatted(date: .omitted, time: .shortened)) – \(endText)")
+                    .lineLimit(1)
+                Text(manual ? "\(part) · added by hand" : part)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(running ? formatClock(duration) : formatDuration(duration))
+                .monospacedDigit()
+                .foregroundStyle(running ? Color.orange : Color.primary)
+            if let onDelete {
+                Button(action: onDelete) {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Delete this session")
+            }
+        }
     }
 }
 
@@ -2761,7 +3218,17 @@ struct MonthSummary {
     struct TaskLine: Identifiable {
         let task: TaskItem
         let monthTime: TimeInterval        // time worked on it in this month
+        let byKind: [StageKind: TimeInterval]   // all its time, per kind of part
         var id: UUID { task.id }
+    }
+
+    // One kind of part across the month's tasks: total, how many tasks had it, average per task
+    struct PartLine: Identifiable {
+        let kind: StageKind
+        let total: TimeInterval
+        let tasks: Int
+        var average: TimeInterval { tasks > 0 ? total / Double(tasks) : 0 }
+        var id: StageKind { kind }
     }
 
     struct ClientLine: Identifiable {
@@ -2781,6 +3248,11 @@ struct MonthSummary {
     let done: Int
     let waiting: Int
     let working: Int
+    let parts: [PartLine]                  // Body, Body revisions, Hooks, Hooks revisions
+
+    func tasksWith(_ kind: StageKind) -> Int {
+        parts.first { $0.kind == kind }?.tasks ?? 0
+    }
 
     init(tasks: [TaskItem], month: Date, client: String?, now: Date) {
         let cal = Calendar.current
@@ -2801,7 +3273,7 @@ struct MonthSummary {
             }
             let plannedThisMonth = task.day >= month && task.day < end
             guard monthTime >= 1 || plannedThisMonth else { continue }
-            lines.append(TaskLine(task: task, monthTime: monthTime))
+            lines.append(TaskLine(task: task, monthTime: monthTime, byKind: task.timeByKind(now: now)))
             clientTime[task.client, default: 0] += monthTime
             clientTasks[task.client, default: 0] += 1
         }
@@ -2820,6 +3292,19 @@ struct MonthSummary {
         self.done = lines.filter { $0.task.status == .done }.count
         self.waiting = lines.filter { $0.task.isAwaitingReview }.count
         self.working = lines.filter { $0.task.isOpen }.count
+
+        var partTotal: [StageKind: TimeInterval] = [:]
+        var partTasks: [StageKind: Int] = [:]
+        for line in lines {
+            for (kind, t) in line.byKind {
+                partTotal[kind, default: 0] += t
+                partTasks[kind, default: 0] += 1
+            }
+        }
+        self.parts = StageKind.allCases.compactMap { kind in
+            guard let count = partTasks[kind] else { return nil }
+            return PartLine(kind: kind, total: partTotal[kind] ?? 0, tasks: count)
+        }
     }
 }
 
@@ -2913,15 +3398,23 @@ struct ReportsView: View {
                                             set: { if !$0 { selectedTaskID = nil } })) {
                 if let id = selectedTaskID {
                     ScrollView {
-                        TaskDetailView(taskID: id, day: Calendar.current.startOfDay(for: Date())) {
-                            selectedTaskID = nil
+                        VStack(alignment: .leading, spacing: 0) {
+                            TaskDetailView(taskID: id, day: Calendar.current.startOfDay(for: Date()),
+                                           showReportButton: false) {
+                                selectedTaskID = nil
+                            }
+                            Divider().padding(.horizontal, 16)
+                            TaskStatsView(taskID: id)
                         }
                     }
-                    .inspectorColumnWidth(min: 330, ideal: 340, max: 420)
+                    .inspectorColumnWidth(min: 340, ideal: 350, max: 420)
                 }
             }
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Search tasks or clients")
+        // Opened from "Task Report" on a task card in the menu bar
+        .onAppear(perform: showRequestedTask)
+        .onChange(of: store.reportTaskID) { _, _ in showRequestedTask() }
         // Another month: show its last week (or this week for the current month)
         .onChange(of: month) { _, newMonth in
             let cal = Calendar.current
@@ -2983,9 +3476,22 @@ struct ReportsView: View {
             .padding(.bottom, 2)
     }
 
+    private func showRequestedTask() {
+        guard let id = store.reportTaskID else { return }
+        search = ""
+        selectedTaskID = id
+        store.reportTaskID = nil
+    }
+
     @ToolbarContentBuilder
     private var backupButtons: some ToolbarContent {
         ToolbarItemGroup {
+            Button {
+                store.openBackupsFolder()
+            } label: {
+                Label("Automatic Backups", systemImage: "clock.arrow.circlepath")
+            }
+            .help("Open the folder with the automatic daily backups (last 30 days)")
             Button {
                 store.importBackup()
             } label: {
@@ -3024,6 +3530,9 @@ struct MonthDashboard: View {
                 header
                 statCards
                 WeekCard(week: week, weekStart: $weekStart)
+                if !summary.parts.isEmpty {
+                    partsCard
+                }
                 if showClients && !summary.clients.isEmpty {
                     clientsCard
                 }
@@ -3053,6 +3562,12 @@ struct MonthDashboard: View {
             }
             Spacer()
             HStack(spacing: 6) {
+                Button(action: exportCSV) {
+                    Label("Export CSV", systemImage: "tablecells")
+                }
+                .buttonStyle(.bordered)
+                .help("Save this month's tasks as a spreadsheet (opens in Excel or Numbers)")
+                .padding(.trailing, 10)
                 if !isCurrentMonth {
                     Button("This Month") { month = startOfMonth(Date()) }
                         .buttonStyle(.link)
@@ -3076,6 +3591,52 @@ struct MonthDashboard: View {
         month = Calendar.current.date(byAdding: .month, value: months, to: month) ?? month
     }
 
+    // One row per task: client, day, status, minutes per kind of part, this month and total
+    private func exportCSV() {
+        NSApp.activate(ignoringOtherApps: true)
+        let monthText = month.formatted(.iso8601.year().month())
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "Taskovi \(title) \(monthText).csv"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        func field(_ value: String) -> String {
+            "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        }
+        func minutes(_ t: TimeInterval) -> String { "\(Int((t / 60).rounded()))" }
+
+        let kinds = StageKind.allCases
+        var rows: [[String]] = [
+            ["Task", "Client", "Planned day", "Status"]
+            + kinds.map { "\($0.groupTitle) (min)" }
+            + ["This month (min)", "This month", "Total (min)", "Total"]
+        ]
+        for line in summary.lines {
+            let task = line.task
+            let total = task.elapsed()
+            rows.append([task.title, clientDisplayName(task.client),
+                         task.day.formatted(.iso8601.year().month().day()), task.progressTitle]
+                        + kinds.map { minutes(line.byKind[$0] ?? 0) }
+                        + [minutes(line.monthTime), formatDuration(line.monthTime),
+                           minutes(total), formatDuration(total)])
+        }
+        let monthTotal = summary.lines.reduce(0) { $0 + $1.monthTime }
+        rows.append(["Total", "", "", ""] + kinds.map { _ in "" }
+                    + [minutes(monthTotal), formatDuration(monthTotal), "", ""])
+
+        // BOM so Excel reads letters like č and ć correctly
+        let csv = "\u{FEFF}" + rows.map { $0.map(field).joined(separator: ",") }.joined(separator: "\r\n") + "\r\n"
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't save the CSV file"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
     private var statCards: some View {
         let count = summary.days.count
         let average = count > 0 ? summary.total / Double(count) : 0
@@ -3092,6 +3653,59 @@ struct MonthDashboard: View {
                      value: "\(summary.waiting)", detail: "sent, no answer yet")
             StatCard(icon: "circle.lefthalf.filled", color: .orange, title: "In progress",
                      value: "\(summary.working)", detail: "still to work on")
+        }
+    }
+
+    // How long each kind of part takes on average, and how often revisions come back
+    private var partsCard: some View {
+        let bodyTasks = summary.tasksWith(.body)
+        let hooksTasks = summary.tasksWith(.hooks)
+        var notes: [String] = []
+        if bodyTasks > 0 {
+            notes.append("\(summary.tasksWith(.bodyFix)) of \(bodyTasks) bodies got a revision")
+        }
+        if hooksTasks > 0 {
+            notes.append("\(summary.tasksWith(.hooksFix)) of \(hooksTasks) hooks got a revision")
+        }
+
+        return ReportCard(title: "By Part", trailing: "tasks of this month") {
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text("Part")
+                    Spacer()
+                    Text("Tasks").frame(width: 60, alignment: .trailing)
+                    Text("Total").frame(width: 80, alignment: .trailing)
+                    Text("Average per task").frame(width: 120, alignment: .trailing)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 6)
+                ForEach(summary.parts) { part in
+                    HStack(spacing: 12) {
+                        Text(part.kind.groupTitle)
+                        Spacer()
+                        Text("\(part.tasks)")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 60, alignment: .trailing)
+                        Text(formatDuration(part.total))
+                            .monospacedDigit()
+                            .frame(width: 80, alignment: .trailing)
+                        Text(formatDuration(part.average))
+                            .fontWeight(.semibold)
+                            .monospacedDigit()
+                            .frame(width: 120, alignment: .trailing)
+                    }
+                    .padding(.vertical, 5)
+                }
+                if !notes.isEmpty {
+                    Text(notes.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 8)
+                }
+            }
         }
     }
 
