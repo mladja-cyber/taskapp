@@ -105,12 +105,36 @@ enum TaskStatus: String, Codable, CaseIterable {
         case .done: return .green
         }
     }
+}
 
-    var next: TaskStatus {
-        switch self {
-        case .todo: return .inProgress
-        case .inProgress: return .done
-        case .done: return .todo
+// The parts of a task, in order:
+// Body → Fix body 1, 2… → (approved) → Hooks → Fix hooks 1, 2… → (approved) → Done
+enum StageKind: String, Codable {
+    case body, bodyFix, hooks, hooksFix
+
+    var isBodyPart: Bool { self == .body || self == .bodyFix }
+}
+
+enum StageState: String, Codable {
+    case working    // being worked on
+    case sent       // sent for review, waiting for an answer
+    case revision   // review came back with a revision (a fix part follows)
+    case approved   // review approved it
+}
+
+struct TaskStage: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var kind: StageKind
+    var number: Int = 0          // which fix: 1, 2, …  (0 for Body and Hooks)
+    var state: StageState = .working
+    var sentAt: Date? = nil
+
+    var title: String {
+        switch kind {
+        case .body: return "Body"
+        case .bodyFix: return "Fix body \(number)"
+        case .hooks: return "Hooks"
+        case .hooksFix: return "Fix hooks \(number)"
         }
     }
 }
@@ -125,8 +149,103 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var timeSpent: TimeInterval? = nil   // saved work time (seconds)
     var startedAt: Date? = nil           // set while the timer is running
     var sessions: [WorkSession]? = nil   // every start–stop period, for Reports
+    var stages: [TaskStage]? = nil       // Body, fixes, Hooks… (the last one is the current part)
 
     var isRunning: Bool { startedAt != nil }
+
+    var currentStage: TaskStage? { stages?.last }
+
+    // Sent for review and waiting for an answer: finished for now, not counted as open
+    var isAwaitingReview: Bool { status != .done && currentStage?.state == .sent }
+
+    // Still to be worked on (counted in the menu bar, can be overdue)
+    var isOpen: Bool { status != .done && !isAwaitingReview }
+
+    // Tasks saved before parts existed start with a Body part
+    mutating func ensureStages() {
+        guard stages?.isEmpty ?? true else { return }
+        stages = [TaskStage(kind: .body, state: status == .done ? .approved : .working)]
+    }
+
+    // The part that starts when a review comes back with a revision
+    func revisionStage() -> TaskStage? {
+        guard let last = currentStage else { return nil }
+        let kind: StageKind = last.kind.isBodyPart ? .bodyFix : .hooksFix
+        let number = (stages ?? []).filter { $0.kind == kind }.count + 1
+        return TaskStage(kind: kind, number: number)
+    }
+
+    // The part that starts when a review is approved (none after the hooks: the task is done)
+    func approvalStage() -> TaskStage? {
+        guard let last = currentStage, last.kind.isBodyPart else { return nil }
+        return TaskStage(kind: .hooks)
+    }
+
+    // Where the task is now: "Body", "Fix body 1 sent", "Done"…
+    var progressTitle: String {
+        if status == .done { return "Done" }
+        guard let stage = currentStage else { return status.title }
+        return stage.state == .sent ? "\(stage.title) sent" : stage.title
+    }
+
+    var progressIcon: String {
+        if status == .done { return "checkmark.circle.fill" }
+        if isAwaitingReview { return "paperplane.circle.fill" }
+        return isRunning || elapsed() > 0 ? "circle.lefthalf.filled" : "circle"
+    }
+
+    var progressColor: Color {
+        if status == .done { return .green }
+        if isAwaitingReview { return .blue }
+        return isRunning || elapsed() > 0 ? .orange : .gray
+    }
+
+    // The part a work session belongs to (time from before parts existed counts as the first part)
+    private func stageID(of session: WorkSession) -> UUID? {
+        session.stageID ?? stages?.first?.id
+    }
+
+    func stageTitle(of session: WorkSession) -> String {
+        let id = stageID(of: session)
+        return stages?.first { $0.id == id }?.title ?? ""
+    }
+
+    // Total time worked on one part
+    func time(of stage: TaskStage, now: Date = Date()) -> TimeInterval {
+        let list = sessions ?? []
+        var total = list.filter { stageID(of: $0) == stage.id }.reduce(0) { $0 + $1.duration }
+        if let start = startedAt, stage.id == currentStage?.id { total += now.timeIntervalSince(start) }
+        if stage.id == stages?.first?.id {
+            let untracked = (timeSpent ?? 0) - list.reduce(0) { $0 + $1.duration }
+            if untracked > 1 { total += untracked }
+        }
+        return total
+    }
+
+    // Time worked on each part on one calendar day, in order: [(part, seconds)]
+    func stageTimes(on day: Date, now: Date = Date()) -> [(stage: TaskStage, seconds: TimeInterval)] {
+        let cal = Calendar.current
+        let dayStart = cal.startOfDay(for: day)
+        let dayEnd = cal.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        func overlap(_ s: Date, _ e: Date) -> TimeInterval {
+            max(0, min(e, dayEnd).timeIntervalSince(max(s, dayStart)))
+        }
+        let list = sessions ?? []
+        var perStage: [UUID: TimeInterval] = [:]
+        for session in list {
+            if let id = stageID(of: session) { perStage[id, default: 0] += overlap(session.start, session.end) }
+        }
+        if let start = startedAt, let id = currentStage?.id { perStage[id, default: 0] += overlap(start, now) }
+        let untracked = (timeSpent ?? 0) - list.reduce(0) { $0 + $1.duration }
+        if untracked > 1 && cal.isDate(self.day, inSameDayAs: dayStart), let id = stages?.first?.id {
+            perStage[id, default: 0] += untracked
+        }
+        return (stages ?? []).compactMap { stage -> (stage: TaskStage, seconds: TimeInterval)? in
+            let t = perStage[stage.id] ?? 0
+            guard t >= 1 else { return nil }
+            return (stage: stage, seconds: t)
+        }
+    }
     var totalSeconds: TimeInterval { elapsed() }   // used for sorting in Reports
 
     // Total time worked, including the currently running part
@@ -178,6 +297,7 @@ struct WorkSession: Identifiable, Codable, Equatable {
     var id = UUID()
     var start: Date
     var end: Date
+    var stageID: UUID? = nil   // the part of the task this time was spent on
     var duration: TimeInterval { end.timeIntervalSince(start) }
 }
 
@@ -262,7 +382,13 @@ final class TaskStore: ObservableObject {
             if let decoded = try? JSONDecoder().decode([TaskItem].self, from: data) {
                 // Each task exists only once
                 var seen = Set<UUID>()
-                tasks = decoded.filter { seen.insert($0.id).inserted }
+                tasks = decoded
+                    .filter { seen.insert($0.id).inserted }
+                    .map { task in
+                        var t = task
+                        t.ensureStages()
+                        return t
+                    }
             } else {
                 // Never lose data: keep an untouched copy if it can't be read
                 defaults.set(data, forKey: "\(tasksKey).unreadable-\(stamp)")
@@ -305,40 +431,144 @@ final class TaskStore: ObservableObject {
         tasks
             .filter { Calendar.current.isDate($0.day, inSameDayAs: day) }
             .sorted {
-                ($0.status == .done ? 1 : 0, $0.client.lowercased(), $0.title.lowercased()) <
-                ($1.status == .done ? 1 : 0, $1.client.lowercased(), $1.title.lowercased())
+                ($0.isOpen ? 0 : 1, $0.client.lowercased(), $0.title.lowercased()) <
+                ($1.isOpen ? 0 : 1, $1.client.lowercased(), $1.title.lowercased())
             }
     }
 
     func overdue(before day: Date) -> [TaskItem] {
-        tasks.filter { $0.day < day && $0.status != .done }
+        tasks.filter { $0.day < day && $0.isOpen }
     }
 
-    // Number of open tasks for today (plus overdue ones), shown in the menu bar
+    // Number of open tasks for today (plus overdue ones), shown in the menu bar.
+    // Tasks sent for review don't count until a revision or approval comes back.
     var openTodayCount: Int {
-        let todayOpen = tasks(for: today).filter { $0.status != .done }.count
+        let todayOpen = tasks(for: today).filter(\.isOpen).count
         return todayOpen + overdue(before: today).count
     }
 
     func add(title: String, client: String, day: Date, reminder: Date?) {
-        let task = TaskItem(title: title, client: client, day: day, reminder: reminder)
+        var task = TaskItem(title: title, client: client, day: day, reminder: reminder)
+        task.ensureStages()
         tasks.append(task)
         schedule(task)
     }
 
-    func cycle(_ task: TaskItem) {
-        setStatus(task, task.status.next)
+    private func index(of task: TaskItem) -> Int? {
+        tasks.firstIndex { $0.id == task.id }
     }
 
-    func setStatus(_ task: TaskItem, _ status: TaskStatus) {
-        guard let i = tasks.firstIndex(where: { $0.id == task.id }) else { return }
-        let old = tasks[i].status
-        tasks[i].status = status
-        if status == .inProgress && old != .inProgress {
-            startTimer(at: i)          // In Progress starts the timer
-        } else if status != .inProgress {
-            stopTimer(at: i)           // Done / To Do stops it and saves the time
+    private var todayStart: Date { Calendar.current.startOfDay(for: Date()) }
+
+    // To Do until time is tracked, then In Progress (Done is set only when the task is finished)
+    private func updateStatus(at i: Int) {
+        guard tasks[i].status != .done else { return }
+        tasks[i].status = tasks[i].isRunning || tasks[i].elapsed() > 0 ? .inProgress : .todo
+    }
+
+    // MARK: Parts (Body → fixes → Hooks → fixes → Done)
+
+    // Tasks sent for review and still waiting for an answer, oldest first
+    func awaitingReview(excluding shown: Set<UUID>) -> [TaskItem] {
+        tasks
+            .filter { $0.isAwaitingReview && !shown.contains($0.id) }
+            .sorted { ($0.currentStage?.sentAt ?? $0.day) < ($1.currentStage?.sentAt ?? $1.day) }
+    }
+
+    // Finish the current part and send it for review. It counts as finished for today.
+    func sendForReview(_ task: TaskItem) {
+        guard let i = index(of: task), tasks[i].isOpen,
+              var stages = tasks[i].stages, !stages.isEmpty else { return }
+        stopTimer(at: i)
+        stages[stages.count - 1].state = .sent
+        stages[stages.count - 1].sentAt = Date()
+        tasks[i].stages = stages
+        setDay(at: i, to: todayStart)
+        updateStatus(at: i)
+        schedule(tasks[i])
+    }
+
+    // The review came back with a revision: the next fix starts today, with its own timer running
+    func markRevision(_ task: TaskItem) {
+        guard let i = index(of: task), tasks[i].isAwaitingReview,
+              var stages = tasks[i].stages, let next = tasks[i].revisionStage() else { return }
+        stages[stages.count - 1].state = .revision
+        stages.append(next)
+        tasks[i].stages = stages
+        setDay(at: i, to: todayStart)
+        startTimer(at: i)
+        updateStatus(at: i)
+        schedule(tasks[i])
+    }
+
+    // The review approved it: after the body, Hooks start today (timer running);
+    // after the hooks, the task is done
+    func markApproved(_ task: TaskItem) {
+        guard let i = index(of: task), tasks[i].isAwaitingReview,
+              var stages = tasks[i].stages else { return }
+        let next = tasks[i].approvalStage()
+        stages[stages.count - 1].state = .approved
+        if let next {
+            stages.append(next)
+            tasks[i].stages = stages
+            setDay(at: i, to: todayStart)
+            startTimer(at: i)
+        } else {
+            tasks[i].stages = stages
+            tasks[i].status = .done
         }
+        updateStatus(at: i)
+        schedule(tasks[i])
+    }
+
+    // Finish the whole task at once, whatever part it is in
+    func markDone(_ task: TaskItem) {
+        guard let i = index(of: task), tasks[i].status != .done else { return }
+        stopTimer(at: i)
+        if var stages = tasks[i].stages, !stages.isEmpty {
+            stages[stages.count - 1].state = .approved
+            tasks[i].stages = stages
+        }
+        tasks[i].status = .done
+        schedule(tasks[i])
+    }
+
+    // A part started by mistake can be removed while it has less than this much time
+    private static let undoLimit: TimeInterval = 5 * 60
+
+    // Name of the step that can be undone, or nil
+    func undoStepTitle(_ task: TaskItem) -> String? {
+        guard let stages = task.stages, let last = stages.last else { return nil }
+        if task.status == .done { return "Reopen Task" }
+        if last.state == .sent { return "Undo Send" }
+        if stages.count > 1 && task.time(of: last) < Self.undoLimit {
+            return stages[stages.count - 2].state == .revision ? "Undo Revision" : "Undo Approval"
+        }
+        return nil
+    }
+
+    // Undo a misclick: reopen a done task, take back a send, or remove a part that was just started
+    func undoStep(_ task: TaskItem) {
+        guard let i = index(of: task), undoStepTitle(tasks[i]) != nil,
+              var stages = tasks[i].stages else { return }
+        if tasks[i].status == .done {
+            tasks[i].status = .inProgress
+            stages[stages.count - 1].state = .sent
+        } else if stages[stages.count - 1].state == .sent {
+            stages[stages.count - 1].state = .working
+            stages[stages.count - 1].sentAt = nil
+        } else {
+            // Remove the part and the few minutes tracked on it; the previous part waits for review again
+            stopTimer(at: i)
+            let removed = stages.removeLast()
+            let sessions = tasks[i].sessions ?? []
+            let removedTime = sessions.filter { $0.stageID == removed.id }.reduce(0) { $0 + $1.duration }
+            tasks[i].sessions = sessions.filter { $0.stageID != removed.id }
+            tasks[i].timeSpent = max(0, (tasks[i].timeSpent ?? 0) - removedTime)
+            stages[stages.count - 1].state = .sent
+        }
+        tasks[i].stages = stages
+        updateStatus(at: i)
         schedule(tasks[i])
     }
 
@@ -397,10 +627,12 @@ final class TaskStore: ObservableObject {
             // otherwise everything between export and import would count as work.
             var imported = backup.tasks
             for i in imported.indices {
+                imported[i].ensureStages()
                 guard let start = imported[i].startedAt else { continue }
                 let end = max(start, backup.exportedAt)
                 imported[i].timeSpent = (imported[i].timeSpent ?? 0) + end.timeIntervalSince(start)
-                imported[i].sessions = (imported[i].sessions ?? []) + [WorkSession(start: start, end: end)]
+                imported[i].sessions = (imported[i].sessions ?? [])
+                    + [WorkSession(start: start, end: end, stageID: imported[i].currentStage?.id)]
                 imported[i].startedAt = nil
             }
 
@@ -424,16 +656,14 @@ final class TaskStore: ObservableObject {
     // MARK: Timer
 
     // Play / pause button
+    // (only for a part being worked on, not while it waits for review)
     func toggleTimer(_ task: TaskItem) {
-        guard let i = tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        guard let i = index(of: task) else { return }
         if tasks[i].isRunning {
             stopTimer(at: i)
-        } else {
+        } else if tasks[i].isOpen {
             startTimer(at: i)
-            if tasks[i].status != .inProgress {
-                tasks[i].status = .inProgress
-                schedule(tasks[i])
-            }
+            updateStatus(at: i)
         }
     }
 
@@ -451,7 +681,8 @@ final class TaskStore: ObservableObject {
         guard let start = tasks[i].startedAt else { return }
         let end = Date()
         tasks[i].timeSpent = (tasks[i].timeSpent ?? 0) + end.timeIntervalSince(start)
-        tasks[i].sessions = (tasks[i].sessions ?? []) + [WorkSession(start: start, end: end)]
+        tasks[i].sessions = (tasks[i].sessions ?? [])
+            + [WorkSession(start: start, end: end, stageID: tasks[i].currentStage?.id)]
         tasks[i].startedAt = nil
     }
 
@@ -573,7 +804,7 @@ final class TaskStore: ObservableObject {
     func canMoveToPreviousDay(_ task: TaskItem) -> Bool {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
-        return task.status != .done && cal.startOfDay(for: task.day) > today
+        return task.isOpen && cal.startOfDay(for: task.day) > today
     }
 
     func moveToPreviousDay(_ task: TaskItem) {
@@ -605,7 +836,7 @@ final class TaskStore: ObservableObject {
         tasks[i].day = m.oldDay
         tasks[i].reminder = m.oldReminder
         // The move paused the timer; undo starts it again
-        if m.wasRunning && tasks[i].status != .done {
+        if m.wasRunning && tasks[i].isOpen {
             startTimer(at: i)
         }
         schedule(tasks[i])
@@ -614,9 +845,19 @@ final class TaskStore: ObservableObject {
 
     private func move(_ task: TaskItem, to newDay: Date) {
         guard let i = tasks.firstIndex(where: { $0.id == task.id }) else { return }
-        let cal = Calendar.current
         let wasRunning = tasks[i].isRunning
         stopTimer(at: i)   // pause, so the time so far is saved on the day it was worked
+        lastMove = MoveRecord(taskID: tasks[i].id, title: tasks[i].title,
+                              oldDay: tasks[i].day, oldReminder: tasks[i].reminder, newDay: newDay,
+                              wasRunning: wasRunning)
+        setDay(at: i, to: newDay)
+        schedule(tasks[i])
+    }
+
+    // Plans the task on another day. Time already worked stays on the days it was worked.
+    private func setDay(at i: Int, to newDay: Date) {
+        let cal = Calendar.current
+        guard !cal.isDate(tasks[i].day, inSameDayAs: newDay) else { return }
 
         // Time tracked before session history existed: pin it to the old day
         let untracked = (tasks[i].timeSpent ?? 0) - (tasks[i].sessions ?? []).reduce(0) { $0 + $1.duration }
@@ -624,15 +865,11 @@ final class TaskStore: ObservableObject {
             let start = cal.startOfDay(for: tasks[i].day)
             tasks[i].sessions = (tasks[i].sessions ?? []) + [WorkSession(start: start, end: start.addingTimeInterval(untracked))]
         }
-        lastMove = MoveRecord(taskID: tasks[i].id, title: tasks[i].title,
-                              oldDay: tasks[i].day, oldReminder: tasks[i].reminder, newDay: newDay,
-                              wasRunning: wasRunning)
         if let r = tasks[i].reminder {
             let c = cal.dateComponents([.hour, .minute], from: r)
             tasks[i].reminder = cal.date(bySettingHour: c.hour ?? 9, minute: c.minute ?? 0, second: 0, of: newDay)
         }
         tasks[i].day = newDay
-        schedule(tasks[i])
     }
 
     func delete(_ task: TaskItem) {
@@ -852,6 +1089,7 @@ struct PlanView: View {
     @AppStorage("lastClient") private var newClient = ""   // remembers the last client you picked
     @State private var useReminder = false
     @State private var reminderTime = Date()
+    @AppStorage("showWaiting") private var showWaiting = true
 
     private var cal: Calendar { Calendar.current }
     private var today: Date { cal.startOfDay(for: Date()) }
@@ -934,12 +1172,17 @@ struct PlanView: View {
     private var taskList: some View {
         let overdue = overdueTasks
         let list = store.tasks(for: selectedDay)
-        let shown = Set(overdue.map(\.id) + list.map(\.id))
+        // Today also lists every task waiting for review, so it's quick to find when the answer comes
+        let waiting = isToday ? store.awaitingReview(excluding: Set(list.map(\.id))) : []
+        let shown = Set(overdue.map(\.id) + list.map(\.id) + waiting.map(\.id))
         let history = store.workedElsewhere(on: selectedDay, excluding: shown)
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 2) {
-                if overdue.isEmpty && list.isEmpty && history.isEmpty {
+                if !waiting.isEmpty {
+                    waitingSection(waiting)
+                }
+                if overdue.isEmpty && list.isEmpty && history.isEmpty && waiting.isEmpty {
                     Text("No tasks for this day")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -956,11 +1199,41 @@ struct PlanView: View {
                 }
             }
         }
-        .frame(height: 220)
+        .frame(height: 250)
         .overlay(alignment: .bottom) {
             if let move = store.lastMove {
                 UndoBar(move: move)
             }
+        }
+    }
+
+    // "Waiting for review (3)" — click the header to show or hide the tasks
+    private func waitingSection(_ waiting: [TaskItem]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Button {
+                showWaiting.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: showWaiting ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 10)
+                    Image(systemName: "paperplane")
+                    Text("Waiting for review (\(waiting.count))")
+                    Spacer()
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.blue)
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showWaiting {
+                ForEach(waiting) { task in
+                    TaskRow(task: task, day: selectedDay)
+                }
+            }
+            Divider().padding(.vertical, 2)
         }
     }
 
@@ -1058,7 +1331,7 @@ struct PlanView: View {
 
     private var footer: some View {
         let dayTasks = store.tasks(for: selectedDay)
-        let done = dayTasks.filter { $0.status == .done }.count
+        let done = dayTasks.filter { !$0.isOpen }.count   // done, or sent for review
 
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -1101,7 +1374,7 @@ struct PlanView: View {
     private func dayButton(_ day: Date, worked: [Date: [String: TimeInterval]]) -> some View {
         let isSelected = cal.isDate(day, inSameDayAs: selectedDay)
         let isDayToday = cal.isDate(day, inSameDayAs: today)
-        let open = store.tasks(for: day).filter { $0.status != .done }.count
+        let open = store.tasks(for: day).filter(\.isOpen).count
         let tracked = (worked[cal.startOfDay(for: day)]?.values.reduce(0, +) ?? 0) >= 60
         // Dot: past days = you tracked time that day; today and later = open tasks
         let showDot = day < today ? tracked : (open > 0 || tracked)
@@ -1158,7 +1431,7 @@ struct TaskRow: View {
             statusButton
             details
             Spacer()
-            if task.status != .done {
+            if task.isOpen {
                 timerButton
             }
             trailingControls
@@ -1173,16 +1446,47 @@ struct TaskRow: View {
         }
     }
 
+    // Working: click = finish this part and send it for review.
+    // Waiting for review: click = choose Revision or Approved.
+    @ViewBuilder
     private var statusButton: some View {
-        Button {
-            store.cycle(task)
-        } label: {
-            Image(systemName: task.status.icon)
-                .foregroundStyle(task.status.color)
-                .font(.system(size: 15))
+        let icon = Image(systemName: task.progressIcon)
+            .foregroundStyle(task.progressColor)
+            .font(.system(size: 15))
+
+        if task.status == .done {
+            icon.help("Done")
+        } else if task.isAwaitingReview {
+            Menu {
+                reviewMenuItems
+            } label: {
+                icon
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Review came back? Choose Revision or Approved")
+        } else {
+            Button {
+                store.sendForReview(task)
+            } label: {
+                icon
+            }
+            .buttonStyle(.plain)
+            .help("Finish \(task.currentStage?.title ?? "this part") and send it for review")
         }
-        .buttonStyle(.plain)
-        .help("Click to change the status")
+    }
+
+    @ViewBuilder
+    private var reviewMenuItems: some View {
+        if let next = task.revisionStage() {
+            Button("Revision \u{2192} Start \(next.title)") { store.markRevision(task) }
+        }
+        if let next = task.approvalStage() {
+            Button("Approved \u{2192} Start \(next.title)") { store.markApproved(task) }
+        } else {
+            Button("Approved \u{2192} Task Done") { store.markApproved(task) }
+        }
     }
 
     private var details: some View {
@@ -1195,7 +1499,7 @@ struct TaskRow: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(task.title)
                 .strikethrough(task.status == .done)
-                .foregroundStyle(task.status == .done ? Color.secondary : Color.primary)
+                .foregroundStyle(task.isOpen ? Color.primary : Color.secondary)
                 .lineLimit(1)
             infoLine
                 .font(.caption)
@@ -1215,10 +1519,20 @@ struct TaskRow: View {
             if overdue {
                 Text("Overdue").foregroundStyle(.red)
             }
+            if let sent = sentOnAnotherDay {
+                Text("sent \(sent)").foregroundStyle(.blue)
+            }
             timeInfo
                 .layoutPriority(1)
                 .fixedSize()
         }
+    }
+
+    // "Mon, Oct 5" when the task waits for review since another day than the one shown
+    private var sentOnAnotherDay: String? {
+        guard task.isAwaitingReview, let sent = task.currentStage?.sentAt,
+              !Calendar.current.isDate(sent, inSameDayAs: day) else { return nil }
+        return sent.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale))
     }
 
     @ViewBuilder
@@ -1261,18 +1575,21 @@ struct TaskRow: View {
         }
     }
 
+    // The part the task is in: "Body", "Fix body 1 sent", "Hooks", "Done"…
     private var statusBadge: some View {
-        Text(task.status.title)
+        Text(task.progressTitle)
             .font(.caption2)
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(task.status.color.opacity(0.15), in: Capsule())
+            .background(task.progressColor.opacity(0.15), in: Capsule())
     }
 
     // Move to tomorrow, shown when the mouse is over the task
     private var moveButton: some View {
         HoverIconButton(icon: "arrow.turn.up.right",
-                        visible: hovering && task.status != .done,
+                        visible: hovering && task.isOpen,
                         help: "Move to tomorrow") {
             store.moveToNextDay(task)
         }
@@ -1287,17 +1604,31 @@ struct TaskRow: View {
 
     @ViewBuilder
     private var menuItems: some View {
-        ForEach(TaskStatus.allCases, id: \.self) { s in
-            Button(s.title) { store.setStatus(task, s) }
+        if task.isOpen {
+            Button(task.isRunning ? "Pause Timer" : "Start Timer") { store.toggleTimer(task) }
+            if let stage = task.currentStage {
+                Button("Finish \(stage.title) & Send for Review") { store.sendForReview(task) }
+            }
         }
-        Divider()
-        if overdue {
-            Button("Move to Today") { store.moveToToday(task) }
+        if task.isAwaitingReview {
+            reviewMenuItems
         }
-        if store.canMoveToPreviousDay(task) {
-            Button("Move to Previous Day") { store.moveToPreviousDay(task) }
+        if task.status != .done {
+            Button("Mark Whole Task as Done") { store.markDone(task) }
         }
-        Button("Move to Tomorrow") { store.moveToNextDay(task) }
+        if let undo = store.undoStepTitle(task) {
+            Button(undo) { store.undoStep(task) }
+        }
+        if task.isOpen {
+            Divider()
+            if overdue {
+                Button("Move to Today") { store.moveToToday(task) }
+            }
+            if store.canMoveToPreviousDay(task) {
+                Button("Move to Previous Day") { store.moveToPreviousDay(task) }
+            }
+            Button("Move to Tomorrow") { store.moveToNextDay(task) }
+        }
         Divider()
         Button("Edit…") { editing = true }
         Button("Delete", role: .destructive) { store.confirmDelete(task) }
@@ -1470,6 +1801,12 @@ struct HistoryTaskRow: View {
     @EnvironmentObject var store: TaskStore
     @State private var editing = false
 
+    private func partsText(now: Date) -> String {
+        let parts = task.stageTimes(on: day, now: now)
+        guard !parts.isEmpty else { return formatDuration(task.time(on: day, now: now)) }
+        return parts.map { "\($0.stage.title) \(formatDuration($0.seconds))" }.joined(separator: " · ")
+    }
+
     private var movedText: String {
         "→ " + task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale))
     }
@@ -1508,8 +1845,9 @@ struct HistoryTaskRow: View {
             if !task.client.isEmpty {
                 Text(task.client)
             }
+            // Which parts you worked on this day, e.g. "Body 1h 10m · Fix body 1 20m"
             TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
-                Label(formatDuration(task.time(on: day, now: context.date)), systemImage: "timer")
+                Label(partsText(now: context.date), systemImage: "timer")
                     .monospacedDigit()
             }
             .fixedSize()
@@ -1754,6 +2092,64 @@ struct TaskTotalHeader: View {
     }
 }
 
+// Time per part of the selected task: "Body 1h 20m · Fix body 1 25m · Hooks 40m (sent)"
+struct TaskStagesLine: View {
+    let task: TaskItem
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
+            ScrollView(.horizontal, showsIndicators: false) {
+                stagesRow(now: context.date)
+            }
+        }
+    }
+
+    private func stagesRow(now: Date) -> some View {
+        HStack(spacing: 14) {
+            ForEach(task.stages ?? []) { stage in
+                HStack(spacing: 4) {
+                    Image(systemName: icon(stage))
+                        .foregroundStyle(color(stage))
+                    Text(stage.title)
+                    Text(formatDuration(task.time(of: stage, now: now)))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .fixedSize()
+                .help(help(stage))
+            }
+        }
+        .lineLimit(1)
+    }
+
+    private func icon(_ stage: TaskStage) -> String {
+        switch stage.state {
+        case .working: return "circle.lefthalf.filled"
+        case .sent: return "paperplane.circle.fill"
+        case .revision: return "arrow.uturn.backward.circle.fill"
+        case .approved: return "checkmark.circle.fill"
+        }
+    }
+
+    private func color(_ stage: TaskStage) -> Color {
+        switch stage.state {
+        case .working: return .orange
+        case .sent: return .blue
+        case .revision: return .red
+        case .approved: return .green
+        }
+    }
+
+    private func help(_ stage: TaskStage) -> String {
+        switch stage.state {
+        case .working: return "Working on it"
+        case .sent: return "Sent for review"
+        case .revision: return "Got a revision"
+        case .approved: return "Approved"
+        }
+    }
+}
+
 // Time worked on the selected task, per date
 struct TaskDaysList: View {
     let task: TaskItem?
@@ -1978,21 +2374,26 @@ struct ReportsView: View {
             // Tasks table (click a column header to sort, right-click to edit)
             tasksTable(list)
 
-            // Selected task: total, time per day, and work sessions
+            // Selected task: total, time per part, time per day, and work sessions
             GroupBox {
-                HStack(alignment: .top, spacing: 20) {
-                    TaskDaysList(task: selectedTask)
-                        .frame(width: 230, alignment: .topLeading)
-                    Divider()
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("Work Sessions")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.secondary)
-                        sessionsView
+                VStack(alignment: .leading, spacing: 10) {
+                    if let task = selectedTask {
+                        TaskStagesLine(task: task)
                     }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    HStack(alignment: .top, spacing: 20) {
+                        TaskDaysList(task: selectedTask)
+                            .frame(width: 200, alignment: .topLeading)
+                        Divider()
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("Work Sessions")
+                                .font(.subheadline.bold())
+                                .foregroundStyle(.secondary)
+                            sessionsView
+                        }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
                 }
-                .frame(height: 170, alignment: .top)
+                .frame(height: 190, alignment: .top)
             } label: {
                 TaskTotalHeader(task: selectedTask)
             }
@@ -2010,8 +2411,8 @@ struct ReportsView: View {
                 Text(task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
             }
             TableColumn("Status", value: \.status.rawValue) { task in
-                Label(task.status.title, systemImage: task.status.icon)
-                    .foregroundStyle(task.status.color)
+                Label(task.progressTitle, systemImage: task.progressIcon)
+                    .foregroundStyle(task.progressColor)
             }
             TableColumn("Time", value: \.totalSeconds) { task in
                 TaskTimeCell(task: task)
@@ -2048,6 +2449,7 @@ struct ReportsView: View {
                         if let start = task.startedAt {
                             TimelineView(.periodic(from: .now, by: 1)) { context in
                                 sessionRow(start: start, endText: "now",
+                                           part: task.currentStage?.title ?? "",
                                            duration: context.date.timeIntervalSince(start),
                                            running: true)
                             }
@@ -2055,6 +2457,7 @@ struct ReportsView: View {
                         ForEach(sessions) { s in
                             sessionRow(start: s.start,
                                        endText: s.end.formatted(date: .omitted, time: .shortened),
+                                       part: task.stageTitle(of: s),
                                        duration: s.duration,
                                        running: false)
                         }
@@ -2069,12 +2472,16 @@ struct ReportsView: View {
         }
     }
 
-    private func sessionRow(start: Date, endText: String, duration: TimeInterval, running: Bool) -> some View {
+    private func sessionRow(start: Date, endText: String, part: String,
+                            duration: TimeInterval, running: Bool) -> some View {
         HStack {
             Text(start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
-                .frame(width: 110, alignment: .leading)
+                .frame(width: 100, alignment: .leading)
             Text("\(start.formatted(date: .omitted, time: .shortened)) – \(endText)")
-                .frame(width: 170, alignment: .leading)
+                .frame(width: 150, alignment: .leading)
+            Text(part)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             Spacer()
             Text(running ? formatClock(duration) : formatDuration(duration))
                 .monospacedDigit()
