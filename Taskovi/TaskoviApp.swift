@@ -1443,8 +1443,8 @@ struct PlanView: View {
 
     private var reminderRow: some View {
         // Re-checked every 15 seconds, so the warning appears once the time passes
-        TimelineView(.periodic(from: .now, by: 15)) { context in
-            let past = reminderInPast(now: context.date)
+        LiveView(every: 15) { now in
+            let past = reminderInPast(now: now)
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Toggle(isOn: $useReminder) {
@@ -1962,8 +1962,8 @@ struct HistoryTaskRow: View {
                 Text(task.client)
             }
             // Which parts you worked on this day, e.g. "Body 1h 10m · Revision 1 20m"
-            TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
-                Label(partsText(now: context.date), systemImage: "timer")
+            LiveView(every: task.isRunning ? 1 : 60) { now in
+                Label(partsText(now: now), systemImage: "timer")
                     .monospacedDigit()
             }
             .fixedSize()
@@ -1987,8 +1987,8 @@ struct TaskDetailView: View {
             if editing {
                 TaskEditView(task: task) { editing = false }
             } else {
-                TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 30)) { context in
-                    content(task, now: context.date)
+                LiveView(every: task.isRunning ? 1 : 30) { now in
+                    content(task, now: now)
                 }
             }
         } else {
@@ -2364,6 +2364,26 @@ struct TaskEditView: View {
     }
 }
 
+// Shows content that refreshes on a timer (for live times) and also right away whenever
+// anything it uses changes. TimelineView only redraws on its own schedule, so a click
+// could take up to a minute to show; this redraws immediately.
+struct LiveView<Content: View>: View {
+    let every: TimeInterval
+    @ViewBuilder let content: (Date) -> Content
+    @State private var tick = Date()
+
+    var body: some View {
+        let _ = tick   // redraw on every tick
+        content(Date())
+            .task(id: every) {
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: UInt64(every * 1_000_000_000))
+                    tick = Date()
+                }
+            }
+    }
+}
+
 // Small icon button that only appears on hover (keeps its space so the row doesn't jump)
 struct HoverIconButton: View {
     let icon: String
@@ -2645,15 +2665,14 @@ struct ReportsView: View {
 
     var body: some View {
         NavigationSplitView {
-            // Not inside a TimelineView: rebuilding the list every tick breaks clicking in it.
-            // It updates whenever the tasks change.
+            // Updates whenever the tasks change
             sidebar(MonthSummary(tasks: store.tasks, month: month, client: nil, now: Date()))
                 .navigationSplitViewColumnWidth(min: 210, ideal: 240)
         } detail: {
-            TimelineView(.periodic(from: .now, by: refresh)) { context in
+            LiveView(every: refresh) { now in
                 if search.trimmingCharacters(in: .whitespaces).isEmpty {
                     MonthDashboard(
-                        summary: MonthSummary(tasks: store.tasks, month: month, client: client, now: context.date),
+                        summary: MonthSummary(tasks: store.tasks, month: month, client: client, now: now),
                         title: client.map(clientDisplayName) ?? "All Clients",
                         showClients: client == nil,
                         month: $month,
@@ -2661,7 +2680,7 @@ struct ReportsView: View {
                         selectClient: { selection = .client($0) },
                         showAll: { selection = .all })
                 } else {
-                    SearchResultsView(query: search, now: context.date, selectedTaskID: $selectedTaskID)
+                    SearchResultsView(query: search, now: now, selectedTaskID: $selectedTaskID)
                 }
             }
             .inspector(isPresented: Binding(get: { selectedTaskID != nil },
