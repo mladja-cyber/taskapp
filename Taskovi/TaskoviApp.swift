@@ -2617,24 +2617,40 @@ struct MonthSummary {
 }
 
 // One row in the Reports sidebar: title on the left, time on the right
+// A plain button (not a List selection, which didn't react to clicks here),
+// highlighted by hand when selected
 struct SidebarRow: View {
     let title: String
     let icon: String?
     let value: String
+    let selected: Bool
+    var action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
-        HStack {
-            if let icon {
-                Label(title, systemImage: icon)
-            } else {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if let icon {
+                    Image(systemName: icon)
+                        .frame(width: 16)
+                }
                 Text(title)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text(value)
+                    .monospacedDigit()
+                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
             }
-            Spacer()
-            Text(value)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(selected ? Color.accentColor
+                                 : (hovering ? Color.primary.opacity(0.07) : Color.clear),
+                        in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
         }
-        .contentShape(Rectangle())
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -2647,14 +2663,14 @@ enum ReportsScope: Hashable {
 struct ReportsView: View {
     @EnvironmentObject var store: TaskStore
 
-    @State private var selection: ReportsScope? = .all
+    @State private var selection: ReportsScope = .all
     @State private var month = startOfMonth(Date())
     @State private var search = ""
     @State private var selectedTaskID: UUID?
 
     // nil = all clients (also when nothing is selected in the sidebar)
     private var client: String? {
-        if case .client(let name)? = selection { return name }
+        if case .client(let name) = selection { return name }
         return nil
     }
 
@@ -2667,7 +2683,7 @@ struct ReportsView: View {
         NavigationSplitView {
             // Updates whenever the tasks change
             sidebar(MonthSummary(tasks: store.tasks, month: month, client: nil, now: Date()))
-                .navigationSplitViewColumnWidth(min: 210, ideal: 240)
+                .navigationSplitViewColumnWidth(240)   // fixed: dragging it broke the layout
         } detail: {
             LiveView(every: refresh) { now in
                 if search.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -2697,7 +2713,7 @@ struct ReportsView: View {
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Search tasks or clients")
         .toolbar { backupButtons }
-        .frame(minWidth: 960, minHeight: 600)
+        .frame(minWidth: 1100, minHeight: 620)
     }
 
     private func sidebar(_ all: MonthSummary) -> some View {
@@ -2708,21 +2724,35 @@ struct ReportsView: View {
             ((times[$0] ?? 0), $1.lowercased()) > ((times[$1] ?? 0), $0.lowercased())
         }
 
-        return List(selection: $selection) {
-            Section(month.formatted(.dateTime.month(.wide).year().locale(appLocale))) {
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                sidebarHeader(month.formatted(.dateTime.month(.wide).year().locale(appLocale)))
                 SidebarRow(title: "All Clients", icon: "square.grid.2x2",
-                           value: all.total > 0 ? formatDuration(all.total) : "–")
-                    .tag(ReportsScope?.some(.all))
-            }
-            Section("Clients") {
+                           value: all.total > 0 ? formatDuration(all.total) : "–",
+                           selected: selection == .all) {
+                    selection = .all
+                }
+                sidebarHeader("Clients")
+                    .padding(.top, 14)
                 ForEach(sorted, id: \.self) { name in
                     let t = times[name] ?? 0
                     SidebarRow(title: clientDisplayName(name), icon: nil,
-                               value: t > 0 ? formatDuration(t) : "–")
-                        .tag(ReportsScope?.some(.client(name)))
+                               value: t > 0 ? formatDuration(t) : "–",
+                               selected: selection == .client(name)) {
+                        selection = .client(name)
+                    }
                 }
             }
+            .padding(10)
         }
+    }
+
+    private func sidebarHeader(_ text: String) -> some View {
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.bottom, 2)
     }
 
     @ToolbarContentBuilder
