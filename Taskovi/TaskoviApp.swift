@@ -108,7 +108,7 @@ enum TaskStatus: String, Codable, CaseIterable {
 }
 
 // The parts of a task, in order:
-// Body → Fix body 1, 2… → (approved) → Hooks → Fix hooks 1, 2… → (approved) → Done
+// Body → Revision 1, 2… → (approved) → Hooks → Hooks revision 1, 2… → (approved) → Done
 enum StageKind: String, Codable {
     case body, bodyFix, hooks, hooksFix
 
@@ -118,23 +118,50 @@ enum StageKind: String, Codable {
 enum StageState: String, Codable {
     case working    // being worked on
     case sent       // sent for review, waiting for an answer
-    case revision   // review came back with a revision (a fix part follows)
+    case revision   // review came back with a revision (a revision part follows)
     case approved   // review approved it
 }
 
 struct TaskStage: Identifiable, Codable, Equatable {
     var id = UUID()
     var kind: StageKind
-    var number: Int = 0          // which fix: 1, 2, …  (0 for Body and Hooks)
+    var number: Int = 0          // which revision: 1, 2, …  (0 for Body and Hooks)
     var state: StageState = .working
     var sentAt: Date? = nil
 
     var title: String {
         switch kind {
         case .body: return "Body"
-        case .bodyFix: return "Fix body \(number)"
+        case .bodyFix: return "Revision \(number)"
         case .hooks: return "Hooks"
-        case .hooksFix: return "Fix hooks \(number)"
+        case .hooksFix: return "Hooks revision \(number)"
+        }
+    }
+
+    var stateIcon: String {
+        switch state {
+        case .working: return "circle.lefthalf.filled"
+        case .sent: return "paperplane.circle.fill"
+        case .revision: return "arrow.uturn.backward.circle.fill"
+        case .approved: return "checkmark.circle.fill"
+        }
+    }
+
+    var stateColor: Color {
+        switch state {
+        case .working: return .orange
+        case .sent: return .blue
+        case .revision: return .red
+        case .approved: return .green
+        }
+    }
+
+    var stateTitle: String {
+        switch state {
+        case .working: return "Working on it"
+        case .sent: return "Sent for review"
+        case .revision: return "Got a revision"
+        case .approved: return "Approved"
         }
     }
 }
@@ -149,7 +176,7 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var timeSpent: TimeInterval? = nil   // saved work time (seconds)
     var startedAt: Date? = nil           // set while the timer is running
     var sessions: [WorkSession]? = nil   // every start–stop period, for Reports
-    var stages: [TaskStage]? = nil       // Body, fixes, Hooks… (the last one is the current part)
+    var stages: [TaskStage]? = nil       // Body, revisions, Hooks… (the last one is the current part)
 
     var isRunning: Bool { startedAt != nil }
 
@@ -181,7 +208,7 @@ struct TaskItem: Identifiable, Codable, Equatable {
         return TaskStage(kind: .hooks)
     }
 
-    // Where the task is now: "Body", "Fix body 1 sent", "Done"…
+    // Where the task is now: "Body", "Revision 1 sent", "Done"…
     var progressTitle: String {
         if status == .done { return "Done" }
         guard let stage = currentStage else { return status.title }
@@ -466,7 +493,7 @@ final class TaskStore: ObservableObject {
         tasks[i].status = tasks[i].isRunning || tasks[i].elapsed() > 0 ? .inProgress : .todo
     }
 
-    // MARK: Parts (Body → fixes → Hooks → fixes → Done)
+    // MARK: Parts (Body → revisions → Hooks → revisions → Done)
 
     // Tasks sent for review and still waiting for an answer, oldest first
     func awaitingReview(excluding shown: Set<UUID>) -> [TaskItem] {
@@ -488,7 +515,7 @@ final class TaskStore: ObservableObject {
         schedule(tasks[i])
     }
 
-    // The review came back with a revision: the next fix starts today, with its own timer running
+    // The review came back with a revision: the next revision starts today, with its own timer running
     func markRevision(_ task: TaskItem) {
         guard let i = index(of: task), tasks[i].isAwaitingReview,
               var stages = tasks[i].stages, let next = tasks[i].revisionStage() else { return }
@@ -1425,10 +1452,11 @@ struct TaskRow: View {
     @EnvironmentObject var store: TaskStore
     @State private var hovering = false
     @State private var editing = false
+    @State private var showingDetail = false
 
     var body: some View {
         HStack(spacing: 8) {
-            statusButton
+            statusIcon
             details
             Spacer()
             if task.isOpen {
@@ -1437,8 +1465,12 @@ struct TaskRow: View {
             trailingControls
         }
         .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .background(hovering ? Color.primary.opacity(0.06) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+        .onTapGesture { showingDetail = true }   // click a task to see it and its next step
         .contextMenu { menuItems }
         .popover(isPresented: $editing, arrowEdge: .trailing) {
             TaskEditView(task: task) { editing = false }
@@ -1446,35 +1478,11 @@ struct TaskRow: View {
         }
     }
 
-    // Working: click = finish this part and send it for review.
-    // Waiting for review: click = choose Revision or Approved.
-    @ViewBuilder
-    private var statusButton: some View {
-        let icon = Image(systemName: task.progressIcon)
+    private var statusIcon: some View {
+        Image(systemName: task.progressIcon)
             .foregroundStyle(task.progressColor)
             .font(.system(size: 15))
-
-        if task.status == .done {
-            icon.help("Done")
-        } else if task.isAwaitingReview {
-            Menu {
-                reviewMenuItems
-            } label: {
-                icon
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("Review came back? Choose Revision or Approved")
-        } else {
-            Button {
-                store.sendForReview(task)
-            } label: {
-                icon
-            }
-            .buttonStyle(.plain)
-            .help("Finish \(task.currentStage?.title ?? "this part") and send it for review")
-        }
+            .frame(width: 17)
     }
 
     @ViewBuilder
@@ -1491,8 +1499,10 @@ struct TaskRow: View {
 
     private var details: some View {
         detailsContent
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) { editing = true }   // double-click the name to edit
+            .popover(isPresented: $showingDetail, arrowEdge: .trailing) {
+                TaskDetailView(taskID: task.id, day: day) { showingDetail = false }
+                    .environmentObject(store)
+            }
     }
 
     private var detailsContent: some View {
@@ -1575,7 +1585,7 @@ struct TaskRow: View {
         }
     }
 
-    // The part the task is in: "Body", "Fix body 1 sent", "Hooks", "Done"…
+    // The part the task is in: "Body", "Revision 1 sent", "Hooks", "Done"…
     private var statusBadge: some View {
         Text(task.progressTitle)
             .font(.caption2)
@@ -1799,7 +1809,8 @@ struct HistoryTaskRow: View {
     let task: TaskItem
     let day: Date
     @EnvironmentObject var store: TaskStore
-    @State private var editing = false
+    @State private var hovering = false
+    @State private var showingDetail = false
 
     private func partsText(now: Date) -> String {
         let parts = task.stageTimes(on: day, now: now)
@@ -1829,13 +1840,18 @@ struct HistoryTaskRow: View {
             Spacer()
         }
         .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .background(hovering ? Color.primary.opacity(0.06) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture { showingDetail = true }
         .help("Worked on this day, continued on another day")
         .contextMenu {
-            Button("Edit…") { editing = true }
+            Button("Open…") { showingDetail = true }
         }
-        .popover(isPresented: $editing, arrowEdge: .trailing) {
-            TaskEditView(task: task) { editing = false }
+        .popover(isPresented: $showingDetail, arrowEdge: .trailing) {
+            TaskDetailView(taskID: task.id, day: day) { showingDetail = false }
                 .environmentObject(store)
         }
     }
@@ -1845,7 +1861,7 @@ struct HistoryTaskRow: View {
             if !task.client.isEmpty {
                 Text(task.client)
             }
-            // Which parts you worked on this day, e.g. "Body 1h 10m · Fix body 1 20m"
+            // Which parts you worked on this day, e.g. "Body 1h 10m · Revision 1 20m"
             TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
                 Label(partsText(now: context.date), systemImage: "timer")
                     .monospacedDigit()
@@ -1854,6 +1870,285 @@ struct HistoryTaskRow: View {
             Text(movedText)
                 .fixedSize()
         }
+    }
+}
+
+// The card that opens when you click a task: where it is, time per part,
+// and big buttons for the next step (Start Body, Finish Body, Revision, Approved…)
+struct TaskDetailView: View {
+    let taskID: UUID
+    let day: Date          // the day shown in Plan
+    var onClose: () -> Void
+    @EnvironmentObject var store: TaskStore
+    @State private var editing = false
+
+    var body: some View {
+        if let task = store.tasks.first(where: { $0.id == taskID }) {
+            if editing {
+                TaskEditView(task: task) { editing = false }
+            } else {
+                TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 30)) { context in
+                    content(task, now: context.date)
+                }
+            }
+        } else {
+            Text("This task was deleted.")
+                .foregroundStyle(.secondary)
+                .padding(20)
+        }
+    }
+
+    private func content(_ task: TaskItem, now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header(task)
+            currentCard(task, now: now)
+            partsList(task, now: now)
+            actions(task)
+            Divider()
+            footer(task)
+        }
+        .padding(16)
+        .frame(width: 310)
+    }
+
+    // MARK: Header
+
+    private func header(_ task: TaskItem) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(task.title)
+                .font(.title3.weight(.semibold))
+                .lineLimit(2)
+            HStack(spacing: 10) {
+                if !task.client.isEmpty {
+                    Label(task.client, systemImage: "person")
+                }
+                Label(task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)),
+                      systemImage: "calendar")
+                if let r = task.reminder {
+                    Label(r.formatted(date: .omitted, time: .shortened), systemImage: "bell")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+    }
+
+    // MARK: Where the task is now
+
+    private func currentCard(_ task: TaskItem, now: Date) -> some View {
+        let done = task.status == .done
+        let partTime = task.currentStage.map { task.time(of: $0, now: now) } ?? 0
+        let timeText = done ? formatDuration(task.elapsed(at: now))
+                            : (task.isRunning ? formatClock(partTime) : formatDuration(partTime))
+
+        return HStack(spacing: 12) {
+            Image(systemName: task.progressIcon)
+                .font(.system(size: 28))
+                .foregroundStyle(task.progressColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(done ? "Task finished" : (task.currentStage?.title ?? ""))
+                    .font(.headline)
+                Text(stateText(task, partTime: partTime))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 4)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(timeText)
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(task.isRunning ? Color.orange : Color.primary)
+                Text(done ? "total" : "this part")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(task.progressColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(task.progressColor.opacity(0.25)))
+    }
+
+    private func stateText(_ task: TaskItem, partTime: TimeInterval) -> String {
+        if task.status == .done { return "All parts approved" }
+        if task.isAwaitingReview {
+            guard let sent = task.currentStage?.sentAt else { return "Waiting for review" }
+            let when = sent.formatted(.dateTime.weekday(.abbreviated).hour().minute().locale(appLocale))
+            return "Sent \(when) · waiting for review"
+        }
+        if task.isRunning { return "Timer running" }
+        return partTime > 0 ? "Paused" : "Not started yet"
+    }
+
+    // MARK: All parts, in order
+
+    private func partsList(_ task: TaskItem, now: Date) -> some View {
+        let stages = task.stages ?? []
+        // Hooks still to come after the body parts
+        let hooksAhead = task.status != .done && !stages.contains { !$0.kind.isBodyPart }
+
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("PARTS")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("Total \(formatDuration(task.elapsed(at: now)))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .padding(.bottom, 6)
+
+            ForEach(Array(stages.enumerated()), id: \.element.id) { index, stage in
+                partRow(icon: stage.stateIcon,
+                        color: stage.stateColor,
+                        title: stage.title,
+                        subtitle: stage.stateTitle,
+                        time: formatDuration(task.time(of: stage, now: now)),
+                        isCurrent: stage.id == task.currentStage?.id && task.status != .done,
+                        line: index < stages.count - 1 || hooksAhead)
+            }
+            if hooksAhead {
+                partRow(icon: "circle.dotted", color: .secondary, title: "Hooks",
+                        subtitle: "After the body is approved", time: "",
+                        isCurrent: false, line: false)
+                    .opacity(0.5)
+            }
+        }
+    }
+
+    private func partRow(icon: String, color: Color, title: String, subtitle: String,
+                         time: String, isCurrent: Bool, line: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            // Icon with a line down to the next part
+            VStack(spacing: 2) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+                    .foregroundStyle(color)
+                    .frame(height: 16)
+                Rectangle()
+                    .fill(Color.secondary.opacity(line ? 0.3 : 0))
+                    .frame(width: 2, height: 14)
+            }
+            .frame(width: 16)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title)
+                    .fontWeight(isCurrent ? .semibold : .regular)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(time)
+                .font(.callout)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Next step
+
+    @ViewBuilder
+    private func actions(_ task: TaskItem) -> some View {
+        if task.status == .done {
+            EmptyView()
+        } else if task.isAwaitingReview {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Did the review come back?")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button {
+                        store.markRevision(task)
+                    } label: {
+                        Label("Revision", systemImage: "arrow.uturn.backward")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .tint(.orange)
+                    Button {
+                        store.markApproved(task)
+                    } label: {
+                        Label("Approved", systemImage: "checkmark")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .tint(.green)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                Text(reviewHint(task))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        } else if let stage = task.currentStage {
+            let started = task.time(of: stage) > 0
+            VStack(spacing: 8) {
+                Button {
+                    store.toggleTimer(task)
+                } label: {
+                    Label(task.isRunning ? "Pause \(stage.title)"
+                                         : (started ? "Continue \(stage.title)" : "Start \(stage.title)"),
+                          systemImage: task.isRunning ? "pause.fill" : "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .tint(task.isRunning ? Color.orange : Color.accentColor)
+                Button {
+                    store.sendForReview(task)
+                } label: {
+                    Label("Finish \(stage.title) & Send", systemImage: "paperplane.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .tint(.blue)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+        }
+    }
+
+    private func reviewHint(_ task: TaskItem) -> String {
+        let revision = task.revisionStage().map { "Revision starts \($0.title)" } ?? ""
+        let approved = task.approvalStage().map { "Approved starts \($0.title)" } ?? "Approved finishes the task"
+        return "\(revision) · \(approved)"
+    }
+
+    // MARK: Small actions
+
+    private func footer(_ task: TaskItem) -> some View {
+        HStack(spacing: 14) {
+            if let undo = store.undoStepTitle(task) {
+                Button {
+                    store.undoStep(task)
+                } label: {
+                    Label(undo, systemImage: "arrow.uturn.backward")
+                }
+            }
+            Spacer()
+            if task.status != .done {
+                Button {
+                    store.markDone(task)
+                } label: {
+                    Image(systemName: "checkmark.circle")
+                }
+                .help("Mark the whole task as done")
+            }
+            Button {
+                editing = true
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .help("Edit name, client and day")
+            Button {
+                onClose()
+                DispatchQueue.main.async { store.confirmDelete(task) }
+            } label: {
+                Image(systemName: "trash")
+            }
+            .help("Delete task")
+        }
+        .buttonStyle(.borderless)
+        .font(.callout)
+        .foregroundStyle(.secondary)
     }
 }
 
@@ -2092,7 +2387,7 @@ struct TaskTotalHeader: View {
     }
 }
 
-// Time per part of the selected task: "Body 1h 20m · Fix body 1 25m · Hooks 40m (sent)"
+// Time per part of the selected task: "Body 1h 20m · Revision 1 25m · Hooks 40m"
 struct TaskStagesLine: View {
     let task: TaskItem
 
@@ -2108,45 +2403,18 @@ struct TaskStagesLine: View {
         HStack(spacing: 14) {
             ForEach(task.stages ?? []) { stage in
                 HStack(spacing: 4) {
-                    Image(systemName: icon(stage))
-                        .foregroundStyle(color(stage))
+                    Image(systemName: stage.stateIcon)
+                        .foregroundStyle(stage.stateColor)
                     Text(stage.title)
                     Text(formatDuration(task.time(of: stage, now: now)))
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
                 .fixedSize()
-                .help(help(stage))
+                .help(stage.stateTitle)
             }
         }
         .lineLimit(1)
-    }
-
-    private func icon(_ stage: TaskStage) -> String {
-        switch stage.state {
-        case .working: return "circle.lefthalf.filled"
-        case .sent: return "paperplane.circle.fill"
-        case .revision: return "arrow.uturn.backward.circle.fill"
-        case .approved: return "checkmark.circle.fill"
-        }
-    }
-
-    private func color(_ stage: TaskStage) -> Color {
-        switch stage.state {
-        case .working: return .orange
-        case .sent: return .blue
-        case .revision: return .red
-        case .approved: return .green
-        }
-    }
-
-    private func help(_ stage: TaskStage) -> String {
-        switch stage.state {
-        case .working: return "Working on it"
-        case .sent: return "Sent for review"
-        case .revision: return "Got a revision"
-        case .approved: return "Approved"
-        }
     }
 }
 
