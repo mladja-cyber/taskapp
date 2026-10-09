@@ -1149,6 +1149,9 @@ struct PlanView: View {
     @AppStorage("lastClient") private var newClient = ""   // remembers the last client you picked
     @State private var useReminder = false
     @State private var reminderTime = Date()
+    @State private var showReminderPicker = false
+    @State private var addingClient = false
+    @State private var newClientName = ""
     @AppStorage("showWaiting") private var showWaiting = true
     @State private var searching = false
     @State private var query = ""
@@ -1382,18 +1385,53 @@ struct PlanView: View {
         }
     }
 
-    private var newTaskPlaceholder: String {
-        isToday ? "New task…"
-                : "New task for \(selectedDay.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))…"
+    private var selectedDayText: String {
+        selectedDay.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale))
     }
 
+    // "New Task" panel: name + Add, then chips for client, the client's list and a reminder
     private var addTaskForm: some View {
-        VStack(spacing: 6) {
-            clientRow
-            TextField(newTaskPlaceholder, text: $newTitle)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { add(newTitle) }
-            reminderRow
+        // Re-checked every 15 seconds, so the reminder warning appears once the time passes
+        LiveView(every: 15) { now in
+            let past = reminderInPast(now: now)
+            let canAdd = !newTitle.trimmingCharacters(in: .whitespaces).isEmpty && !past
+
+            VStack(alignment: .leading, spacing: 8) {
+                PanelTitle(icon: "plus.circle.fill",
+                           title: "New Task",
+                           detail: isToday ? "for today" : "for \(selectedDayText)")
+                HStack(spacing: 6) {
+                    TextField("Task name, e.g. SC01", text: $newTitle)
+                        .entryField()
+                        .onSubmit { add(newTitle) }
+                    Button {
+                        add(newTitle)
+                    } label: {
+                        Text("Add").fontWeight(.semibold).padding(.horizontal, 4)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canAdd)
+                }
+                HStack(spacing: 6) {
+                    clientChip
+                    if !templates.isEmpty {
+                        templatesChip
+                    }
+                    reminderChip
+                    Spacer(minLength: 0)
+                }
+                if addingClient {
+                    newClientRow
+                }
+                if past {
+                    Label("This time has already passed. Pick a later time or remove the reminder.",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+            .entryPanel()
         }
         .onAppear {
             // Forget the remembered client if it was deleted
@@ -1403,30 +1441,128 @@ struct PlanView: View {
         }
     }
 
-    private var clientRow: some View {
-        HStack(spacing: 6) {
-            Picker("", selection: $newClient) {
-                Text("No client").tag("")
-                ForEach(store.clients) { c in
-                    Text(c.name).tag(c.name)
+    // Who the task is for; also lets you create a new client right here
+    private var clientChip: some View {
+        Menu {
+            Button {
+                newClient = ""
+            } label: {
+                if newClient.isEmpty { Label("No client", systemImage: "checkmark") } else { Text("No client") }
+            }
+            if !store.clients.isEmpty {
+                Divider()
+            }
+            ForEach(store.clients) { c in
+                Button {
+                    newClient = c.name
+                } label: {
+                    if c.name == newClient { Label(c.name, systemImage: "checkmark") } else { Text(c.name) }
                 }
             }
-            .labelsHidden()
-            .fixedSize()
+            Divider()
+            Button {
+                addingClient = true
+            } label: {
+                Label("New Client…", systemImage: "plus")
+            }
+        } label: {
+            Chip(icon: "person.fill", text: newClient.isEmpty ? "Client" : newClient, active: !newClient.isEmpty)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Choose the client")
+    }
 
-            Spacer()
-
-            Menu {
+    // Tasks you regularly do for this client: one click adds it
+    private var templatesChip: some View {
+        Menu {
+            Section("Add from \(newClient)'s list") {
                 ForEach(templates, id: \.self) { t in
                     Button(t) { add(t) }
                 }
-            } label: {
-                Label("From List", systemImage: "list.bullet")
             }
-            .fixedSize()
-            .disabled(templates.isEmpty)
-            .help("Add a task from this client's list")
+        } label: {
+            Chip(icon: "list.bullet", text: "From list", active: false)
         }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Add a task from this client's list")
+    }
+
+    private var reminderChip: some View {
+        Button {
+            if !useReminder {
+                // Suggest the next full hour
+                let next = cal.date(byAdding: .hour, value: 1, to: Date()) ?? Date()
+                reminderTime = cal.date(bySetting: .minute, value: 0, of: next) ?? next
+            }
+            showReminderPicker = true
+        } label: {
+            Chip(icon: useReminder ? "bell.fill" : "bell",
+                 text: useReminder ? reminderTime.formatted(date: .omitted, time: .shortened) : "Reminder",
+                 active: useReminder)
+        }
+        .buttonStyle(.plain)
+        .help("Get a notification at a set time")
+        .popover(isPresented: $showReminderPicker, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Remind me at").font(.headline)
+                DatePicker("", selection: $reminderTime, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .datePickerStyle(.stepperField)
+                HStack {
+                    if useReminder {
+                        Button("Remove") {
+                            useReminder = false
+                            showReminderPicker = false
+                        }
+                    }
+                    Spacer()
+                    Button("Set") {
+                        useReminder = true
+                        showReminderPicker = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(14)
+            .frame(width: 220)
+        }
+    }
+
+    private var newClientRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "person.badge.plus")
+                .foregroundStyle(.secondary)
+            TextField("New client name", text: $newClientName)
+                .entryField()
+                .onSubmit(saveNewClient)
+            Button("Save", action: saveNewClient)
+                .disabled(newClientName.trimmingCharacters(in: .whitespaces).isEmpty)
+            Button {
+                addingClient = false
+                newClientName = ""
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Cancel")
+        }
+    }
+
+    // Adds the client and picks it for the new task
+    private func saveNewClient() {
+        let name = newClientName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        store.addClient(name)
+        newClient = store.clients.first { $0.name.lowercased() == name.lowercased() }?.name ?? name
+        addingClient = false
+        newClientName = ""
     }
 
     // The chosen reminder time on the selected day, or nil when the reminder is off
@@ -1439,39 +1575,6 @@ struct PlanView: View {
     // A reminder in the past would never be shown, so such a task can't be added
     private func reminderInPast(now: Date = Date()) -> Bool {
         reminderDate.map { $0 <= now } ?? false
-    }
-
-    private var reminderRow: some View {
-        // Re-checked every 15 seconds, so the warning appears once the time passes
-        LiveView(every: 15) { now in
-            let past = reminderInPast(now: now)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Toggle(isOn: $useReminder) {
-                        Label("Reminder", systemImage: "bell")
-                    }
-                    .toggleStyle(.checkbox)
-
-                    if useReminder {
-                        DatePicker("", selection: $reminderTime, displayedComponents: .hourAndMinute)
-                            .labelsHidden()
-                            .fixedSize()
-                    }
-
-                    Spacer()
-
-                    Button("Add") { add(newTitle) }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty || past)
-                }
-                if past {
-                    Label("This time has already passed. Pick a later time or turn the reminder off.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-            }
-        }
     }
 
     private var footer: some View {
@@ -2384,6 +2487,103 @@ struct LiveView<Content: View>: View {
     }
 }
 
+// MARK: Entry panels (New Task, New Client, client lists)
+
+extension View {
+    // Text field look used in the entry panels
+    func entryField() -> some View {
+        self
+            .textFieldStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.12)))
+    }
+
+    // Rounded box around an entry panel
+    func entryPanel() -> some View {
+        self
+            .padding(10)
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
+    }
+}
+
+// "⊕ New Task  for today"
+struct PanelTitle: View {
+    let icon: String
+    let title: String
+    var detail: String? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .foregroundStyle(Color.accentColor)
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+            if let detail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+// Small rounded option button: "👤 Siba ▾", "🔔 10:00"
+struct Chip: View {
+    let icon: String
+    let text: String
+    let active: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+            Text(text)
+                .lineLimit(1)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 7, weight: .bold))
+                .opacity(0.6)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(active ? Color.accentColor : Color.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(active ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.07), in: Capsule())
+        .contentShape(Capsule())
+    }
+}
+
+// Title + text field + Add, in a rounded panel
+struct EntryPanel: View {
+    let icon: String
+    let title: String
+    let placeholder: String
+    @Binding var text: String
+    var onAdd: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PanelTitle(icon: icon, title: title)
+            HStack(spacing: 6) {
+                TextField(placeholder, text: $text)
+                    .entryField()
+                    .onSubmit(onAdd)
+                Button(action: onAdd) {
+                    Text("Add").fontWeight(.semibold).padding(.horizontal, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .entryPanel()
+    }
+}
+
 // Small icon button that only appears on hover (keeps its space so the row doesn't jump)
 struct HoverIconButton: View {
     let icon: String
@@ -2463,16 +2663,10 @@ struct ClientsView: View {
                     }
                 }
             }
-            .frame(height: 330)
+            .frame(height: 300)
 
-            HStack {
-                TextField("New client…", text: $newName)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(addClient)
-                Button("Add", action: addClient)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
+            EntryPanel(icon: "person.crop.circle.badge.plus", title: "New Client",
+                       placeholder: "Client name, e.g. Siba", text: $newName, onAdd: addClient)
         }
     }
 
@@ -2516,15 +2710,11 @@ struct ClientsView: View {
                     }
                 }
             }
-            .frame(height: 270)
+            .frame(height: 240)
 
-            HStack {
-                TextField("New task for \(client.name)…", text: $newTemplate)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { addTemplate(to: client) }
-                Button("Add") { addTemplate(to: client) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(newTemplate.trimmingCharacters(in: .whitespaces).isEmpty)
+            EntryPanel(icon: "text.badge.plus", title: "Add to \(client.name)'s list",
+                       placeholder: "Task you often do, e.g. Body", text: $newTemplate) {
+                addTemplate(to: client)
             }
         }
     }
@@ -2665,6 +2855,7 @@ struct ReportsView: View {
 
     @State private var selection: ReportsScope = .all
     @State private var month = startOfMonth(Date())
+    @State private var weekStart = startOfWeek(Date())
     @State private var search = ""
     @State private var selectedTaskID: UUID?
 
@@ -2689,9 +2880,11 @@ struct ReportsView: View {
                 if search.trimmingCharacters(in: .whitespaces).isEmpty {
                     MonthDashboard(
                         summary: MonthSummary(tasks: store.tasks, month: month, client: client, now: now),
+                        week: WeekSummary(tasks: store.tasks, weekStart: weekStart, client: client, now: now),
                         title: client.map(clientDisplayName) ?? "All Clients",
                         showClients: client == nil,
                         month: $month,
+                        weekStart: $weekStart,
                         selectedTaskID: $selectedTaskID,
                         selectClient: { selection = .client($0) },
                         showAll: { selection = .all })
@@ -2712,6 +2905,18 @@ struct ReportsView: View {
             }
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Search tasks or clients")
+        // Another month: show its last week (or this week for the current month)
+        .onChange(of: month) { _, newMonth in
+            let cal = Calendar.current
+            if cal.isDate(newMonth, equalTo: Date(), toGranularity: .month) {
+                weekStart = startOfWeek(Date())
+            } else if newMonth < Date() {
+                let lastDay = cal.date(byAdding: DateComponents(month: 1, day: -1), to: newMonth) ?? newMonth
+                weekStart = startOfWeek(lastDay)
+            } else {
+                weekStart = startOfWeek(newMonth)
+            }
+        }
         .toolbar { backupButtons }
         .frame(minWidth: 1100, minHeight: 620)
     }
@@ -2777,9 +2982,11 @@ struct ReportsView: View {
 // One month: summary cards, time per client, the month's tasks, and time per day
 struct MonthDashboard: View {
     let summary: MonthSummary
+    let week: WeekSummary
     let title: String
     let showClients: Bool
     @Binding var month: Date
+    @Binding var weekStart: Date
     @Binding var selectedTaskID: UUID?
     var selectClient: (String) -> Void
     var showAll: () -> Void
@@ -2793,6 +3000,7 @@ struct MonthDashboard: View {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 statCards
+                WeekCard(week: week, weekStart: $weekStart)
                 if showClients && !summary.clients.isEmpty {
                     clientsCard
                 }
@@ -2932,6 +3140,145 @@ struct MonthDashboard: View {
             }
             .padding(.vertical, 4)
         }
+    }
+}
+
+// Time worked in one week (Monday to Sunday), for all clients or one
+struct WeekSummary {
+    let start: Date
+    let days: [Date]                   // Monday … Sunday
+    let perDay: [Date: TimeInterval]
+    let total: TimeInterval
+    let daysWorked: Int                // days with at least a minute
+    let average: TimeInterval          // per day worked
+    let longest: TimeInterval
+
+    init(tasks: [TaskItem], weekStart: Date, client: String?, now: Date) {
+        let cal = Calendar.current
+        let days = (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: weekStart) }
+        let end = cal.date(byAdding: .day, value: 7, to: weekStart) ?? weekStart
+
+        var perDay: [Date: TimeInterval] = [:]
+        for task in tasks where client == nil || task.client == client {
+            for (day, t) in task.timePerDay(now: now) where day >= weekStart && day < end {
+                perDay[day, default: 0] += t
+            }
+        }
+
+        let total = perDay.values.reduce(0, +)
+        let daysWorked = perDay.values.filter { $0 >= 60 }.count
+        self.start = weekStart
+        self.days = days
+        self.perDay = perDay
+        self.total = total
+        self.daysWorked = daysWorked
+        self.average = daysWorked > 0 ? total / Double(daysWorked) : 0
+        self.longest = max(perDay.values.max() ?? 1, 1)
+    }
+}
+
+// One week: total, days worked, average per day, and a bar for each day
+struct WeekCard: View {
+    let week: WeekSummary
+    @Binding var weekStart: Date
+
+    private var cal: Calendar { Calendar.current }
+
+    private var isThisWeek: Bool {
+        cal.isDate(weekStart, inSameDayAs: startOfWeek(Date()))
+    }
+
+    // "Oct 5 – 11" or "Sep 29 – Oct 5"
+    private var rangeText: String {
+        let last = week.days.last ?? weekStart
+        let first = weekStart.formatted(.dateTime.month(.abbreviated).day().locale(appLocale))
+        let sameMonth = cal.isDate(weekStart, equalTo: last, toGranularity: .month)
+        let end = sameMonth ? last.formatted(.dateTime.day().locale(appLocale))
+                            : last.formatted(.dateTime.month(.abbreviated).day().locale(appLocale))
+        return "\(first) – \(end)"
+    }
+
+    private func shift(_ weeks: Int) {
+        weekStart = cal.date(byAdding: .day, value: 7 * weeks, to: weekStart) ?? weekStart
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+            HStack(spacing: 28) {
+                metric("Total", week.total > 0 ? formatDuration(week.total) : "–")
+                metric("Days worked", "\(week.daysWorked) of 7")
+                metric("Average per day worked", week.average > 0 ? formatDuration(week.average) : "–")
+                Spacer(minLength: 0)
+            }
+            bars
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(reportCardBackground, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text(isThisWeek ? "This Week" : "Week").font(.headline)
+            Text(rangeText).foregroundStyle(.secondary)
+            Spacer()
+            if !isThisWeek {
+                Button("This Week") { weekStart = startOfWeek(Date()) }
+                    .buttonStyle(.link)
+                    .padding(.trailing, 4)
+            }
+            Button { shift(-1) } label: {
+                Image(systemName: "chevron.left").frame(width: 22, height: 22)
+            }
+            .help("Previous week")
+            Button { shift(1) } label: {
+                Image(systemName: "chevron.right").frame(width: 22, height: 22)
+            }
+            .help("Next week")
+        }
+        .buttonStyle(.borderless)
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+        }
+    }
+
+    // Monday … Sunday, today highlighted
+    private var bars: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            ForEach(week.days, id: \.self) { day in
+                let t = week.perDay[day] ?? 0
+                let isToday = cal.isDateInToday(day)
+                VStack(spacing: 5) {
+                    Text(t >= 60 ? formatDuration(t) : "")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(t >= 60 ? Color.accentColor.opacity(isToday ? 1 : 0.6) : Color.primary.opacity(0.08))
+                        .frame(height: t >= 60 ? max(6, 90 * t / week.longest) : 4)
+                    Text(isToday ? "Today" : day.formatted(.dateTime.weekday(.abbreviated).locale(appLocale)))
+                        .font(.caption.weight(isToday ? .semibold : .regular))
+                        .foregroundStyle(isToday ? Color.accentColor : Color.secondary)
+                    Text(day.formatted(.dateTime.day().locale(appLocale)))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .frame(height: 150, alignment: .bottom)
     }
 }
 
