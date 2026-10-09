@@ -229,6 +229,24 @@ final class TaskStore: ObservableObject {
         )
         .sink { [weak self] _ in self?.pauseAll() }
         .store(in: &cancellables)
+
+        // Keep "today" current after midnight, waking from sleep, or a clock change,
+        // so the open-task count in the menu bar moves to the new day on its own
+        Publishers.Merge3(
+            NotificationCenter.default.publisher(for: .NSCalendarDayChanged),
+            NotificationCenter.default.publisher(for: .NSSystemClockDidChange),
+            workspace.publisher(for: NSWorkspace.didWakeNotification)
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in self?.refreshToday() }
+        .store(in: &cancellables)
+    }
+
+    @Published private(set) var today = Calendar.current.startOfDay(for: Date())
+
+    private func refreshToday() {
+        let now = Calendar.current.startOfDay(for: Date())
+        if now != today { today = now }
     }
 
     // Reads the saved data again (used after another copy of the app quits and saves)
@@ -298,7 +316,6 @@ final class TaskStore: ObservableObject {
 
     // Number of open tasks for today (plus overdue ones), shown in the menu bar
     var openTodayCount: Int {
-        let today = Calendar.current.startOfDay(for: Date())
         let todayOpen = tasks(for: today).filter { $0.status != .done }.count
         return todayOpen + overdue(before: today).count
     }
@@ -376,8 +393,20 @@ final class TaskStore: ObservableObject {
             alert.addButton(withTitle: "Cancel")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+            // A timer that was running when the backup was made stopped at export time;
+            // otherwise everything between export and import would count as work.
+            var imported = backup.tasks
+            for i in imported.indices {
+                guard let start = imported[i].startedAt else { continue }
+                let end = max(start, backup.exportedAt)
+                imported[i].timeSpent = (imported[i].timeSpent ?? 0) + end.timeIntervalSince(start)
+                imported[i].sessions = (imported[i].sessions ?? []) + [WorkSession(start: start, end: end)]
+                imported[i].startedAt = nil
+            }
+
             UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
-            tasks = backup.tasks
+            lastMove = nil
+            tasks = imported
             clients = backup.clients
             for task in tasks { schedule(task) }
         } catch {
@@ -563,6 +592,7 @@ final class TaskStore: ObservableObject {
         let oldDay: Date
         let oldReminder: Date?
         let newDay: Date
+        let wasRunning: Bool
     }
 
     @Published var lastMove: MoveRecord?
@@ -574,6 +604,10 @@ final class TaskStore: ObservableObject {
         }
         tasks[i].day = m.oldDay
         tasks[i].reminder = m.oldReminder
+        // The move paused the timer; undo starts it again
+        if m.wasRunning && tasks[i].status != .done {
+            startTimer(at: i)
+        }
         schedule(tasks[i])
         lastMove = nil
     }
@@ -581,6 +615,7 @@ final class TaskStore: ObservableObject {
     private func move(_ task: TaskItem, to newDay: Date) {
         guard let i = tasks.firstIndex(where: { $0.id == task.id }) else { return }
         let cal = Calendar.current
+        let wasRunning = tasks[i].isRunning
         stopTimer(at: i)   // pause, so the time so far is saved on the day it was worked
 
         // Time tracked before session history existed: pin it to the old day
@@ -590,7 +625,8 @@ final class TaskStore: ObservableObject {
             tasks[i].sessions = (tasks[i].sessions ?? []) + [WorkSession(start: start, end: start.addingTimeInterval(untracked))]
         }
         lastMove = MoveRecord(taskID: tasks[i].id, title: tasks[i].title,
-                              oldDay: tasks[i].day, oldReminder: tasks[i].reminder, newDay: newDay)
+                              oldDay: tasks[i].day, oldReminder: tasks[i].reminder, newDay: newDay,
+                              wasRunning: wasRunning)
         if let r = tasks[i].reminder {
             let c = cal.dateComponents([.hour, .minute], from: r)
             tasks[i].reminder = cal.date(bySettingHour: c.hour ?? 9, minute: c.minute ?? 0, second: 0, of: newDay)
@@ -663,6 +699,7 @@ struct ContentView: View {
     @State private var selectedDay = Calendar.current.startOfDay(for: Date())
     @State private var knownToday = Calendar.current.startOfDay(for: Date())
     @State private var lastActive = Date()
+    @State private var hostWindow: NSWindow?
 
     // Opening the app after 2+ minutes away always starts on today
     private func windowBecameActive() {
@@ -758,11 +795,48 @@ struct ContentView: View {
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
             refreshToday()
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+        // Only the menu bar window counts, not Reports or other windows
+        .background(WindowReader { window in
+            if let window { hostWindow = window }
+        })
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard isHostWindow(note) else { return }
             windowBecameActive()
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
+            guard isHostWindow(note) else { return }
             lastActive = Date()
+        }
+    }
+
+    private func isHostWindow(_ note: Notification) -> Bool {
+        guard let window = note.object as? NSWindow, let hostWindow else { return false }
+        return window === hostWindow
+    }
+}
+
+// Reports the window a SwiftUI view is shown in
+struct WindowReader: NSViewRepresentable {
+    let onChange: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> WindowTrackingView {
+        let view = WindowTrackingView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ view: WindowTrackingView, context: Context) {
+        view.onChange = onChange
+    }
+
+    final class WindowTrackingView: NSView {
+        var onChange: ((NSWindow?) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let window = self.window
+            // Outside the current view update, so SwiftUI state can change safely
+            DispatchQueue.main.async { [weak self] in self?.onChange?(window) }
         }
     }
 }
@@ -937,24 +1011,48 @@ struct PlanView: View {
         }
     }
 
+    // The chosen reminder time on the selected day, or nil when the reminder is off
+    private var reminderDate: Date? {
+        guard useReminder else { return nil }
+        let c = cal.dateComponents([.hour, .minute], from: reminderTime)
+        return cal.date(bySettingHour: c.hour ?? 9, minute: c.minute ?? 0, second: 0, of: selectedDay)
+    }
+
+    // A reminder in the past would never be shown, so such a task can't be added
+    private func reminderInPast(now: Date = Date()) -> Bool {
+        reminderDate.map { $0 <= now } ?? false
+    }
+
     private var reminderRow: some View {
-        HStack {
-            Toggle(isOn: $useReminder) {
-                Label("Reminder", systemImage: "bell")
+        // Re-checked every 15 seconds, so the warning appears once the time passes
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            let past = reminderInPast(now: context.date)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Toggle(isOn: $useReminder) {
+                        Label("Reminder", systemImage: "bell")
+                    }
+                    .toggleStyle(.checkbox)
+
+                    if useReminder {
+                        DatePicker("", selection: $reminderTime, displayedComponents: .hourAndMinute)
+                            .labelsHidden()
+                            .fixedSize()
+                    }
+
+                    Spacer()
+
+                    Button("Add") { add(newTitle) }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty || past)
+                }
+                if past {
+                    Label("This time has already passed. Pick a later time or turn the reminder off.",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
-            .toggleStyle(.checkbox)
-
-            if useReminder {
-                DatePicker("", selection: $reminderTime, displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-                    .fixedSize()
-            }
-
-            Spacer()
-
-            Button("Add") { add(newTitle) }
-                .keyboardShortcut(.defaultAction)
-                .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty)
         }
     }
 
@@ -1039,15 +1137,9 @@ struct PlanView: View {
 
     private func add(_ raw: String) {
         let title = raw.trimmingCharacters(in: .whitespaces)
-        guard !title.isEmpty else { return }
+        guard !title.isEmpty, !reminderInPast() else { return }
 
-        var reminder: Date? = nil
-        if useReminder {
-            let c = cal.dateComponents([.hour, .minute], from: reminderTime)
-            reminder = cal.date(bySettingHour: c.hour ?? 9, minute: c.minute ?? 0, second: 0, of: selectedDay)
-        }
-
-        store.add(title: title, client: newClient, day: selectedDay, reminder: reminder)
+        store.add(title: title, client: newClient, day: selectedDay, reminder: reminderDate)
         newTitle = ""
         useReminder = false
     }
@@ -2302,10 +2394,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         guard !others.isEmpty else { return }
 
-        // Ask the older copy to quit, then load what it saved
+        // Ask the older copy to quit, wait until it has really quit (it saves on the way out),
+        // then load what it saved. Gives up waiting after 15 seconds.
         center.postNotificationName(Self.quitOthers, object: myID, userInfo: nil, deliverImmediately: true)
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            for _ in 0..<150 {
+                if others.allSatisfy(\.isTerminated) { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
             TaskStore.shared.reload()
         }
     }
