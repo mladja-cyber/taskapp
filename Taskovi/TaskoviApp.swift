@@ -232,11 +232,6 @@ struct TaskItem: Identifiable, Codable, Equatable {
         session.stageID ?? stages?.first?.id
     }
 
-    func stageTitle(of session: WorkSession) -> String {
-        let id = stageID(of: session)
-        return stages?.first { $0.id == id }?.title ?? ""
-    }
-
     // Total time worked on one part
     func time(of stage: TaskStage, now: Date = Date()) -> TimeInterval {
         let list = sessions ?? []
@@ -273,7 +268,6 @@ struct TaskItem: Identifiable, Codable, Equatable {
             return (stage: stage, seconds: t)
         }
     }
-    var totalSeconds: TimeInterval { elapsed() }   // used for sorting in Reports
 
     // Total time worked, including the currently running part
     func elapsed(at now: Date = Date()) -> TimeInterval {
@@ -491,6 +485,17 @@ final class TaskStore: ObservableObject {
     private func updateStatus(at i: Int) {
         guard tasks[i].status != .done else { return }
         tasks[i].status = tasks[i].isRunning || tasks[i].elapsed() > 0 ? .inProgress : .todo
+    }
+
+    // Tasks whose name or client contains the text: waiting for review first,
+    // then open ones, then done; newest day first
+    func search(_ query: String) -> [TaskItem] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return [] }
+        func rank(_ t: TaskItem) -> Int { t.isAwaitingReview ? 0 : (t.isOpen ? 1 : 2) }
+        return tasks
+            .filter { $0.title.localizedCaseInsensitiveContains(q) || $0.client.localizedCaseInsensitiveContains(q) }
+            .sorted { (rank($0), $1.day) < (rank($1), $0.day) }
     }
 
     // MARK: Parts (Body → revisions → Hooks → revisions → Done)
@@ -1117,6 +1122,9 @@ struct PlanView: View {
     @State private var useReminder = false
     @State private var reminderTime = Date()
     @AppStorage("showWaiting") private var showWaiting = true
+    @State private var searching = false
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
 
     private var cal: Calendar { Calendar.current }
     private var today: Date { cal.startOfDay(for: Date()) }
@@ -1133,14 +1141,95 @@ struct PlanView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            header
-            weekStrip
-            Divider()
-            taskList
-            Divider()
-            addTaskForm
+            if searching {
+                searchBar
+                Divider()
+                searchResults
+            } else {
+                header
+                weekStrip
+                Divider()
+                taskList
+                Divider()
+                addTaskForm
+            }
             footer
         }
+    }
+
+    // MARK: Search
+
+    private func openSearch() {
+        searching = true
+        DispatchQueue.main.async { searchFocused = true }
+    }
+
+    private func closeSearch() {
+        searching = false
+        query = ""
+    }
+
+    private var searchButton: some View {
+        Button(action: openSearch) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .keyboardShortcut("f", modifiers: .command)
+        .help("Search all tasks (\u{2318}F)")
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search all tasks or clients…", text: $query)
+                .textFieldStyle(.plain)
+                .focused($searchFocused)
+                .onExitCommand(perform: closeSearch)   // Esc closes the search
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+            Button("Done", action: closeSearch)
+                .buttonStyle(.link)
+                .font(.caption)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    // Matching tasks from every day; click one to open its card (Move to Today, Revision, Approved…)
+    private var searchResults: some View {
+        let results = store.search(query)
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Text("Type a task or client name")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
+                } else if results.isEmpty {
+                    Text("No tasks found")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
+                }
+                ForEach(results) { task in
+                    TaskRow(task: task, day: task.day, showDay: true)
+                }
+            }
+        }
+        .frame(height: 400)
     }
 
     // How far the selected day is from today
@@ -1177,6 +1266,7 @@ struct PlanView: View {
                 .buttonStyle(.link)
                 .font(.caption)
             }
+            searchButton
         }
     }
 
@@ -1449,6 +1539,7 @@ struct TaskRow: View {
     let task: TaskItem
     let day: Date          // the day shown in Plan
     var overdue: Bool = false
+    var showDay: Bool = false   // search results: show which day the task is planned on
     @EnvironmentObject var store: TaskStore
     @State private var hovering = false
     @State private var editing = false
@@ -1522,6 +1613,11 @@ struct TaskRow: View {
         HStack(spacing: 6) {
             if !task.client.isEmpty {
                 Text(task.client)
+            }
+            if showDay {
+                Label(Calendar.current.isDateInToday(task.day) ? "Today"
+                        : task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)),
+                      systemImage: "calendar")
             }
             if let r = task.reminder {
                 Label(r.formatted(date: .omitted, time: .shortened), systemImage: "bell")
@@ -1652,23 +1748,6 @@ struct TaskRow: View {
     }
 }
 
-// "September: 5 done · 10 in progress · 3 to do" — updates as soon as a status changes
-struct MonthStatusLine: View {
-    let month: Date
-    @EnvironmentObject var store: TaskStore
-
-    var body: some View {
-        let counts = store.statusCounts(inMonthOf: month)
-        HStack(spacing: 8) {
-            Text(month.formatted(.dateTime.month(.wide).locale(appLocale)) + ":")
-            StatusCount(status: .done, count: counts[.done] ?? 0)
-            StatusCount(status: .inProgress, count: counts[.inProgress] ?? 0)
-            StatusCount(status: .todo, count: counts[.todo] ?? 0)
-            Spacer()
-        }
-    }
-}
-
 // Month summary in the main window: one chosen client + total for all clients
 struct MonthStats: View {
     let month: Date
@@ -1756,20 +1835,6 @@ struct CompactCount: View {
         }
         .frame(width: 44, alignment: .leading)
         .help("\(count) \(status.title.lowercased())")
-    }
-}
-
-struct StatusCount: View {
-    let status: TaskStatus
-    let count: Int
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: status.icon)
-                .foregroundStyle(status.color)
-            Text("\(count) \(status.title.lowercased())")
-        }
-        .fixedSize()
     }
 }
 
@@ -1901,6 +1966,9 @@ struct TaskDetailView: View {
     private func content(_ task: TaskItem, now: Date) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             header(task)
+            if task.isOpen && !Calendar.current.isDateInToday(task.day) {
+                moveBanner(task)
+            }
             currentCard(task, now: now)
             partsList(task, now: now)
             actions(task)
@@ -1932,6 +2000,21 @@ struct TaskDetailView: View {
             .foregroundStyle(.secondary)
             .lineLimit(1)
         }
+    }
+
+    // "Planned for Tue, Oct 6 · Move to Today"
+    private func moveBanner(_ task: TaskItem) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "calendar.badge.clock")
+                .foregroundStyle(.orange)
+            Text("Planned for \(task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))")
+                .font(.caption)
+            Spacer()
+            Button("Move to Today") { store.moveToToday(task) }
+                .controlSize(.small)
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
     }
 
     // MARK: Where the task is now
@@ -2371,118 +2454,81 @@ struct ClientsView: View {
 
 // MARK: - Reports window
 
-// "SC60 · 3h 42m total" above the selected task's details
-struct TaskTotalHeader: View {
-    let task: TaskItem?
+func clientDisplayName(_ name: String) -> String {
+    name.isEmpty ? "No Client" : name
+}
 
-    var body: some View {
-        if let task {
-            TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
-                Text("\(task.title) · \(formatDuration(task.elapsed(at: context.date))) total")
-                    .font(.headline)
+// Background of the cards in Reports
+let reportCardBackground = Color(nsColor: .controlBackgroundColor)
+
+// Everything Reports shows for one month (all clients, or one), calculated once
+struct MonthSummary {
+    struct TaskLine: Identifiable {
+        let task: TaskItem
+        let monthTime: TimeInterval        // time worked on it in this month
+        var id: UUID { task.id }
+    }
+
+    struct ClientLine: Identifiable {
+        let name: String
+        let time: TimeInterval
+        let tasks: Int
+        var id: String { name }
+    }
+
+    let lines: [TaskLine]                  // tasks worked on or planned this month, most time first
+    let clients: [ClientLine]              // most time first
+    let perDay: [Date: TimeInterval]
+    let perDayClients: [Date: [String: TimeInterval]]
+    let days: [Date]                       // days with time, newest first
+    let total: TimeInterval
+    let longestDay: TimeInterval
+    let done: Int
+    let waiting: Int
+    let working: Int
+
+    init(tasks: [TaskItem], month: Date, client: String?, now: Date) {
+        let cal = Calendar.current
+        let end = cal.date(byAdding: .month, value: 1, to: month) ?? month
+
+        var lines: [TaskLine] = []
+        var perDay: [Date: TimeInterval] = [:]
+        var perDayClients: [Date: [String: TimeInterval]] = [:]
+        var clientTime: [String: TimeInterval] = [:]
+        var clientTasks: [String: Int] = [:]
+
+        for task in tasks where client == nil || task.client == client {
+            var monthTime: TimeInterval = 0
+            for (day, t) in task.timePerDay(now: now) where day >= month && day < end {
+                monthTime += t
+                perDay[day, default: 0] += t
+                perDayClients[day, default: [:]][task.client, default: 0] += t
             }
-        } else {
-            Text("Task Details").font(.headline)
+            let plannedThisMonth = task.day >= month && task.day < end
+            guard monthTime >= 1 || plannedThisMonth else { continue }
+            lines.append(TaskLine(task: task, monthTime: monthTime))
+            clientTime[task.client, default: 0] += monthTime
+            clientTasks[task.client, default: 0] += 1
         }
+
+        self.lines = lines.sorted {
+            ($0.monthTime, $1.task.title.lowercased()) > ($1.monthTime, $0.task.title.lowercased())
+        }
+        self.clients = clientTasks.keys
+            .map { ClientLine(name: $0, time: clientTime[$0] ?? 0, tasks: clientTasks[$0] ?? 0) }
+            .sorted { ($0.time, $1.name.lowercased()) > ($1.time, $0.name.lowercased()) }
+        self.perDay = perDay
+        self.perDayClients = perDayClients
+        self.days = perDay.keys.filter { (perDay[$0] ?? 0) >= 1 }.sorted(by: >)
+        self.total = perDay.values.reduce(0, +)
+        self.longestDay = max(perDay.values.max() ?? 1, 1)
+        self.done = lines.filter { $0.task.status == .done }.count
+        self.waiting = lines.filter { $0.task.isAwaitingReview }.count
+        self.working = lines.filter { $0.task.isOpen }.count
     }
 }
 
-// Time per part of the selected task: "Body 1h 20m · Revision 1 25m · Hooks 40m"
-struct TaskStagesLine: View {
-    let task: TaskItem
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
-            ScrollView(.horizontal, showsIndicators: false) {
-                stagesRow(now: context.date)
-            }
-        }
-    }
-
-    private func stagesRow(now: Date) -> some View {
-        HStack(spacing: 14) {
-            ForEach(task.stages ?? []) { stage in
-                HStack(spacing: 4) {
-                    Image(systemName: stage.stateIcon)
-                        .foregroundStyle(stage.stateColor)
-                    Text(stage.title)
-                    Text(formatDuration(task.time(of: stage, now: now)))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                .fixedSize()
-                .help(stage.stateTitle)
-            }
-        }
-        .lineLimit(1)
-    }
-}
-
-// Time worked on the selected task, per date
-struct TaskDaysList: View {
-    let task: TaskItem?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("By Day")
-                .font(.subheadline.bold())
-                .foregroundStyle(.secondary)
-            if let task {
-                TimelineView(.periodic(from: .now, by: task.isRunning ? 1 : 60)) { context in
-                    rows(task.timePerDay(now: context.date))
-                }
-            } else {
-                Text("Select a task.")
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 6)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func rows(_ perDay: [Date: TimeInterval]) -> some View {
-        let days = perDay.keys.sorted(by: >)
-        if days.isEmpty {
-            Text("No time tracked yet.")
-                .foregroundStyle(.secondary)
-                .padding(.top, 6)
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(days, id: \.self) { day in
-                        HStack {
-                            Text(day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
-                            Spacer()
-                            Text(formatDuration(perDay[day] ?? 0))
-                                .monospacedDigit()
-                        }
-                    }
-                }
-                .padding(.top, 6)
-            }
-        }
-    }
-}
-
-// Time column in the Reports table (live while running)
-struct TaskTimeCell: View {
-    let task: TaskItem
-
-    var body: some View {
-        if task.isRunning {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text(formatClock(task.elapsed(at: context.date)))
-                    .monospacedDigit()
-                    .foregroundStyle(.orange)
-            }
-        } else {
-            Text(task.elapsed() > 0 ? formatDuration(task.elapsed()) : "–")
-                .monospacedDigit()
-        }
-    }
-}
-
-// One row in the Reports sidebar: title on the left, time on the right, clickable across the full width
+// One row in the Reports sidebar: title on the left, time on the right
 struct SidebarRow: View {
     let title: String
     let icon: String?
@@ -2508,96 +2554,81 @@ struct ReportsView: View {
     @EnvironmentObject var store: TaskStore
 
     private static let allKey = "\u{0}all"
-    private static let timeKey = "\u{0}time"
     @State private var selection: String? = ReportsView.allKey
-    @State private var selectedTaskID: TaskItem.ID?
-    @State private var editingTask: TaskItem?
-    @State private var sortOrder = [KeyPathComparator(\TaskItem.day, order: .reverse)]
+    @State private var month = startOfMonth(Date())
+    @State private var search = ""
+    @State private var selectedTaskID: UUID?
 
-    private struct ClientGroup {
-        let name: String
-        let total: TimeInterval
-        let count: Int
+    // nil = all clients
+    private var client: String? {
+        guard let selection, selection != Self.allKey else { return nil }
+        return selection
     }
 
-    // All clients (including ones only used in tasks), most time first
-    private var groups: [ClientGroup] {
-        let names = Set(store.clients.map(\.name)).union(store.tasks.map(\.client))
-        return names.map { name in
-            let list = store.tasks.filter { $0.client == name }
-            return ClientGroup(name: name,
-                               total: list.reduce(0) { $0 + $1.elapsed() },
-                               count: list.count)
-        }
-        .filter { !($0.name.isEmpty && $0.count == 0) }
-        .sorted { ($0.total, $1.name.lowercased()) > ($1.total, $0.name.lowercased()) }
-    }
-
-    // Time worked this month, shown next to "Daily & Monthly"
-    private var monthTotal: TimeInterval {
-        let start = startOfMonth(Date())
-        return store.timeByDay()
-            .filter { $0.key >= start }
-            .reduce(0) { $0 + $1.value.values.reduce(0, +) }
-    }
-
-    private func durationOrDash(_ t: TimeInterval) -> String {
-        t > 0 ? formatDuration(t) : "–"
-    }
-
-    private func displayName(_ name: String) -> String {
-        name.isEmpty ? "No Client" : name
-    }
-
-    private var rows: [TaskItem] {
-        let list: [TaskItem]
-        if selection == Self.allKey || selection == nil {
-            list = store.tasks
-        } else {
-            list = store.tasks.filter { $0.client == selection }
-        }
-        return list.sorted(using: sortOrder)
-    }
-
-    private var selectedTask: TaskItem? {
-        store.tasks.first { $0.id == selectedTaskID }
+    // Live every second while a timer runs, otherwise once a minute
+    private var refresh: TimeInterval {
+        store.tasks.contains { $0.isRunning } ? 1 : 60
     }
 
     var body: some View {
         NavigationSplitView {
-            sidebar
+            TimelineView(.periodic(from: .now, by: refresh)) { context in
+                sidebar(MonthSummary(tasks: store.tasks, month: month, client: nil, now: context.date))
+            }
+            .navigationSplitViewColumnWidth(min: 210, ideal: 240)
         } detail: {
-            detailArea
-        }
-        .toolbar { backupButtons }
-        .frame(minWidth: 820, minHeight: 520)
-    }
-
-    private var sidebar: some View {
-        List(selection: $selection) {
-            SidebarRow(title: "Daily & Monthly", icon: "calendar", value: durationOrDash(monthTotal))
-                .onTapGesture { selection = Self.timeKey }
-                .tag(String?.some(Self.timeKey))
-
-            SidebarRow(title: "All Clients", icon: "person.3", value: durationOrDash(allTotal))
-                .tag(String?.some(Self.allKey))
-
-            Section("Clients") {
-                ForEach(groups, id: \.name) { g in
-                    SidebarRow(title: displayName(g.name), icon: nil, value: durationOrDash(g.total))
-                        .tag(String?.some(g.name))
+            TimelineView(.periodic(from: .now, by: refresh)) { context in
+                if search.trimmingCharacters(in: .whitespaces).isEmpty {
+                    MonthDashboard(
+                        summary: MonthSummary(tasks: store.tasks, month: month, client: client, now: context.date),
+                        title: client.map(clientDisplayName) ?? "All Clients",
+                        showClients: client == nil,
+                        month: $month,
+                        selectedTaskID: $selectedTaskID,
+                        selectClient: { selection = $0 })
+                } else {
+                    SearchResultsView(query: search, now: context.date, selectedTaskID: $selectedTaskID)
+                }
+            }
+            .inspector(isPresented: Binding(get: { selectedTaskID != nil },
+                                            set: { if !$0 { selectedTaskID = nil } })) {
+                if let id = selectedTaskID {
+                    ScrollView {
+                        TaskDetailView(taskID: id, day: Calendar.current.startOfDay(for: Date())) {
+                            selectedTaskID = nil
+                        }
+                    }
+                    .inspectorColumnWidth(min: 330, ideal: 340, max: 420)
                 }
             }
         }
-        .navigationSplitViewColumnWidth(min: 200, ideal: 240)
+        .searchable(text: $search, placement: .toolbar, prompt: "Search tasks or clients")
+        .toolbar { backupButtons }
+        .frame(minWidth: 960, minHeight: 600)
     }
 
-    @ViewBuilder
-    private var detailArea: some View {
-        if selection == Self.timeKey {
-            TimeOverviewView()
-        } else {
-            detail
+    private func sidebar(_ all: MonthSummary) -> some View {
+        // Every client in the client list, plus names only used in tasks this month
+        let names = Set(store.clients.map(\.name)).union(all.clients.map(\.name))
+        let times = Dictionary(all.clients.map { ($0.name, $0.time) }, uniquingKeysWith: +)
+        let sorted = names.sorted {
+            ((times[$0] ?? 0), $1.lowercased()) > ((times[$1] ?? 0), $0.lowercased())
+        }
+
+        return List(selection: $selection) {
+            Section(month.formatted(.dateTime.month(.wide).year().locale(appLocale))) {
+                SidebarRow(title: "All Clients", icon: "square.grid.2x2",
+                           value: all.total > 0 ? formatDuration(all.total) : "–")
+                    .tag(String?.some(Self.allKey))
+            }
+            Section("Clients") {
+                ForEach(sorted, id: \.self) { name in
+                    let t = times[name] ?? 0
+                    SidebarRow(title: clientDisplayName(name), icon: nil,
+                               value: t > 0 ? formatDuration(t) : "–")
+                        .tag(String?.some(name))
+                }
+            }
         }
     }
 
@@ -2609,307 +2640,372 @@ struct ReportsView: View {
             } label: {
                 Label("Import Backup", systemImage: "square.and.arrow.down")
             }
+            .help("Import Backup")
             Button {
                 store.exportBackup()
             } label: {
                 Label("Export Backup", systemImage: "square.and.arrow.up")
             }
-        }
-    }
-
-    private var allTotal: TimeInterval {
-        store.tasks.reduce(0) { $0 + $1.elapsed() }
-    }
-
-    private var detail: some View {
-        let list = rows
-        let total = list.reduce(0) { $0 + $1.elapsed() }
-        let done = list.filter { $0.status == .done }.count
-        let title = (selection == Self.allKey || selection == nil) ? "All Clients" : displayName(selection ?? "")
-
-        return VStack(alignment: .leading, spacing: 14) {
-            // Summary
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.largeTitle.bold())
-                HStack(spacing: 16) {
-                    Label(formatDuration(total), systemImage: "timer")
-                    Label(list.count == 1 ? "1 task" : "\(list.count) tasks", systemImage: "list.bullet")
-                    Label("\(done) done", systemImage: "checkmark.circle")
-                }
-                .foregroundStyle(.secondary)
-            }
-
-            // Tasks table (click a column header to sort, right-click to edit)
-            tasksTable(list)
-
-            // Selected task: total, time per part, time per day, and work sessions
-            GroupBox {
-                VStack(alignment: .leading, spacing: 10) {
-                    if let task = selectedTask {
-                        TaskStagesLine(task: task)
-                    }
-                    HStack(alignment: .top, spacing: 20) {
-                        TaskDaysList(task: selectedTask)
-                            .frame(width: 200, alignment: .topLeading)
-                        Divider()
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text("Work Sessions")
-                                .font(.subheadline.bold())
-                                .foregroundStyle(.secondary)
-                            sessionsView
-                        }
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                    }
-                }
-                .frame(height: 190, alignment: .top)
-            } label: {
-                TaskTotalHeader(task: selectedTask)
-            }
-        }
-        .padding(20)
-    }
-
-    private func tasksTable(_ list: [TaskItem]) -> some View {
-        Table(list, selection: $selectedTaskID, sortOrder: $sortOrder) {
-            TableColumn("Task", value: \.title)
-            TableColumn("Client", value: \.client) { task in
-                Text(displayName(task.client))
-            }
-            TableColumn("Day", value: \.day) { task in
-                Text(task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
-            }
-            TableColumn("Status", value: \.status.rawValue) { task in
-                Label(task.progressTitle, systemImage: task.progressIcon)
-                    .foregroundStyle(task.progressColor)
-            }
-            TableColumn("Time", value: \.totalSeconds) { task in
-                TaskTimeCell(task: task)
-            }
-        }
-        .contextMenu(forSelectionType: TaskItem.ID.self) { ids in
-            if let id = ids.first, let task = store.tasks.first(where: { $0.id == id }) {
-                Button("Edit…") { editingTask = task }
-                Button("Delete", role: .destructive) { store.confirmDelete(task) }
-            }
-        } primaryAction: { ids in
-            // Double-click a row to edit
-            if let id = ids.first { editingTask = store.tasks.first { $0.id == id } }
-        }
-        .sheet(item: $editingTask) { task in
-            TaskEditView(task: task) { editingTask = nil }
-                .environmentObject(store)
-        }
-    }
-
-    @ViewBuilder
-    private var sessionsView: some View {
-        if let task = selectedTask {
-            let sessions = (task.sessions ?? []).sorted { $0.start > $1.start }
-            if sessions.isEmpty && !task.isRunning {
-                Text(task.elapsed() > 0
-                     ? "This time was tracked before session history was added."
-                     : "No time tracked for this task yet.")
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 6)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if let start = task.startedAt {
-                            TimelineView(.periodic(from: .now, by: 1)) { context in
-                                sessionRow(start: start, endText: "now",
-                                           part: task.currentStage?.title ?? "",
-                                           duration: context.date.timeIntervalSince(start),
-                                           running: true)
-                            }
-                        }
-                        ForEach(sessions) { s in
-                            sessionRow(start: s.start,
-                                       endText: s.end.formatted(date: .omitted, time: .shortened),
-                                       part: task.stageTitle(of: s),
-                                       duration: s.duration,
-                                       running: false)
-                        }
-                    }
-                    .padding(.top, 6)
-                }
-            }
-        } else {
-            Text("Select a task to see when you worked on it.")
-                .foregroundStyle(.secondary)
-                .padding(.top, 6)
-        }
-    }
-
-    private func sessionRow(start: Date, endText: String, part: String,
-                            duration: TimeInterval, running: Bool) -> some View {
-        HStack {
-            Text(start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
-                .frame(width: 100, alignment: .leading)
-            Text("\(start.formatted(date: .omitted, time: .shortened)) – \(endText)")
-                .frame(width: 150, alignment: .leading)
-            Text(part)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Spacer()
-            Text(running ? formatClock(duration) : formatDuration(duration))
-                .monospacedDigit()
-                .foregroundStyle(running ? Color.orange : Color.primary)
+            .help("Export Backup")
         }
     }
 }
 
-// MARK: Daily & Monthly time
-
-struct TimeOverviewView: View {
-    @EnvironmentObject var store: TaskStore
-    @State private var month = startOfMonth(Date())
-
-    private var cal: Calendar { Calendar.current }
-
-    var body: some View {
-        let running = store.tasks.contains { $0.isRunning }
-        TimelineView(.periodic(from: .now, by: running ? 1 : 60)) { context in
-            MonthReport(month: $month, data: MonthData(byDay: store.timeByDay(now: context.date), month: month))
-        }
-    }
-}
-
-// All numbers for one month, calculated once
-struct MonthData {
-    let days: [Date]                       // days with time, newest first
-    let perDay: [Date: TimeInterval]
-    let perDayClients: [Date: [String: TimeInterval]]
-    let clients: [String]                  // most time first
-    let perClient: [String: TimeInterval]
-    let total: TimeInterval
-    let longestDay: TimeInterval
-
-    init(byDay: [Date: [String: TimeInterval]], month: Date) {
-        let end = Calendar.current.date(byAdding: .month, value: 1, to: month) ?? month
-        let inMonth = byDay.filter { $0.key >= month && $0.key < end }
-
-        var perDay: [Date: TimeInterval] = [:]
-        var perClient: [String: TimeInterval] = [:]
-        for (day, clients) in inMonth {
-            for (client, t) in clients {
-                perDay[day, default: 0] += t
-                perClient[client, default: 0] += t
-            }
-        }
-
-        self.perDayClients = inMonth
-        self.perDay = perDay
-        self.perClient = perClient
-        self.days = perDay.keys.sorted(by: >)
-        self.clients = perClient.keys.sorted { (perClient[$0] ?? 0) > (perClient[$1] ?? 0) }
-        self.total = perDay.values.reduce(0, +)
-        self.longestDay = max(perDay.values.max() ?? 1, 1)
-    }
-}
-
-func clientDisplayName(_ name: String) -> String {
-    name.isEmpty ? "No Client" : name
-}
-
-struct MonthReport: View {
+// One month: summary cards, time per client, the month's tasks, and time per day
+struct MonthDashboard: View {
+    let summary: MonthSummary
+    let title: String
+    let showClients: Bool
     @Binding var month: Date
-    let data: MonthData
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            summary
-            MonthStatusLine(month: month)
-                .font(.title3)
-            if !data.clients.isEmpty {
-                clientsBox
-            }
-            daysBox
-        }
-        .padding(20)
-    }
+    @Binding var selectedTaskID: UUID?
+    var selectClient: (String) -> Void
 
     private var isCurrentMonth: Bool {
         Calendar.current.isDate(month, equalTo: Date(), toGranularity: .month)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                header
+                statCards
+                if showClients && !summary.clients.isEmpty {
+                    clientsCard
+                }
+                tasksCard
+                if !summary.days.isEmpty {
+                    daysCard
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // "All Clients" with the month switcher on the right
+    private var header: some View {
+        HStack(alignment: .center) {
+            Text(title)
+                .font(.largeTitle.bold())
+                .lineLimit(1)
+            Spacer()
+            HStack(spacing: 6) {
+                if !isCurrentMonth {
+                    Button("This Month") { month = startOfMonth(Date()) }
+                        .buttonStyle(.link)
+                        .padding(.trailing, 6)
+                }
+                Button { shift(-1) } label: {
+                    Image(systemName: "chevron.left").frame(width: 22, height: 22)
+                }
+                Text(month.formatted(.dateTime.month(.wide).year().locale(appLocale)))
+                    .font(.title3.weight(.semibold))
+                    .frame(minWidth: 140)
+                Button { shift(1) } label: {
+                    Image(systemName: "chevron.right").frame(width: 22, height: 22)
+                }
+            }
+            .buttonStyle(.borderless)
+        }
     }
 
     private func shift(_ months: Int) {
         month = Calendar.current.date(byAdding: .month, value: months, to: month) ?? month
     }
 
-    private var header: some View {
-        HStack(spacing: 10) {
-            Button { shift(-1) } label: { Image(systemName: "chevron.left") }
-                .buttonStyle(.plain)
-            Text(month.formatted(.dateTime.month(.wide).year().locale(appLocale)))
-                .font(.largeTitle.bold())
-            Button { shift(1) } label: { Image(systemName: "chevron.right") }
-                .buttonStyle(.plain)
-            Spacer()
-            if !isCurrentMonth {
-                Button("This Month") { month = startOfMonth(Date()) }
-            }
+    private var statCards: some View {
+        let count = summary.days.count
+        let average = count > 0 ? summary.total / Double(count) : 0
+        let daysText = count == 0 ? "No days worked"
+            : "\(count == 1 ? "1 day" : "\(count) days") · \(formatDuration(average)) a day"
+
+        return HStack(spacing: 12) {
+            StatCard(icon: "timer", color: .accentColor, title: "Time worked",
+                     value: summary.total > 0 ? formatDuration(summary.total) : "–",
+                     detail: daysText)
+            StatCard(icon: "checkmark.circle.fill", color: .green, title: "Done",
+                     value: "\(summary.done)", detail: summary.done == 1 ? "task finished" : "tasks finished")
+            StatCard(icon: "paperplane.circle.fill", color: .blue, title: "Waiting for review",
+                     value: "\(summary.waiting)", detail: "sent, no answer yet")
+            StatCard(icon: "circle.lefthalf.filled", color: .orange, title: "In progress",
+                     value: "\(summary.working)", detail: "still to work on")
         }
     }
 
-    private var summary: some View {
-        let count = data.days.count
-        let totalText = data.total > 0 ? "\(formatDuration(data.total)) total" : "No time tracked"
-        let daysText = count == 1 ? "1 day worked" : "\(count) days worked"
-        let average = count > 0 ? data.total / Double(count) : 0
-
-        return HStack(spacing: 16) {
-            Label(totalText, systemImage: "timer")
-            Label(daysText, systemImage: "calendar")
-            if count > 0 {
-                Label("\(formatDuration(average)) per day on average", systemImage: "chart.bar")
-            }
-        }
-        .foregroundStyle(.secondary)
-    }
-
-    private var clientsBox: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(data.clients, id: \.self) { client in
-                    HStack {
-                        Text(clientDisplayName(client))
-                        Spacer()
-                        Text(formatDuration(data.perClient[client] ?? 0))
-                            .monospacedDigit()
+    // Each client's share of the month
+    private var clientsCard: some View {
+        let longest = max(summary.clients.map(\.time).max() ?? 1, 1)
+        return ReportCard(title: "By Client") {
+            VStack(spacing: 2) {
+                ForEach(summary.clients) { c in
+                    Button {
+                        selectClient(c.name)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Text(clientDisplayName(c.name))
+                                .lineLimit(1)
+                                .frame(width: 150, alignment: .leading)
+                            ProgressBar(fraction: c.time / longest)
+                            Text(c.time > 0 ? formatDuration(c.time) : "–")
+                                .monospacedDigit()
+                                .frame(width: 70, alignment: .trailing)
+                            Text(c.tasks == 1 ? "1 task" : "\(c.tasks) tasks")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 60, alignment: .trailing)
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var tasksCard: some View {
+        ReportCard(title: "Tasks", trailing: summary.lines.isEmpty ? nil : "\(summary.lines.count)") {
+            if summary.lines.isEmpty {
+                Text("No tasks this month.")
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 8)
+            } else {
+                VStack(spacing: 0) {
+                    TaskColumnsHeader(firstTime: "This month", secondTime: "Total")
+                    ForEach(summary.lines) { line in
+                        TaskReportRow(task: line.task,
+                                      firstTime: line.monthTime,
+                                      secondTime: line.task.elapsed(),
+                                      showClient: showClients,
+                                      selected: selectedTaskID == line.task.id) {
+                            selectedTaskID = line.task.id
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var daysCard: some View {
+        ReportCard(title: "By Day") {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(summary.days, id: \.self) { day in
+                    DayReportRow(day: day,
+                                 total: summary.perDay[day] ?? 0,
+                                 longest: summary.longestDay,
+                                 clients: showClients ? (summary.perDayClients[day] ?? [:]) : [:])
                 }
             }
             .padding(.vertical, 4)
-        } label: {
-            Text("By Client").font(.headline)
         }
     }
+}
 
-    private var daysBox: some View {
-        GroupBox {
-            if data.days.isEmpty {
-                Text("No time tracked in this month.")
+// Search across every month: find a task fast, then click it to change its status
+struct SearchResultsView: View {
+    let query: String
+    let now: Date
+    @Binding var selectedTaskID: UUID?
+    @EnvironmentObject var store: TaskStore
+
+    var body: some View {
+        let results = store.search(query)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                Text(results.isEmpty ? "No tasks found"
+                                     : (results.count == 1 ? "1 task found" : "\(results.count) tasks found"))
+                    .font(.largeTitle.bold())
+                Text("Searching all months for \u{201C}\(query)\u{201D}")
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .padding(.top, 6)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(data.days, id: \.self) { day in
-                            DayReportRow(day: day,
-                                         total: data.perDay[day] ?? 0,
-                                         longest: data.longestDay,
-                                         clients: data.perDayClients[day] ?? [:])
+                if !results.isEmpty {
+                    ReportCard(title: "Results") {
+                        VStack(spacing: 0) {
+                            TaskColumnsHeader(firstTime: "Total", secondTime: nil)
+                            ForEach(results) { task in
+                                TaskReportRow(task: task,
+                                              firstTime: task.elapsed(at: now),
+                                              secondTime: nil,
+                                              showClient: true,
+                                              selected: selectedTaskID == task.id) {
+                                    selectedTaskID = task.id
+                                }
+                            }
                         }
                     }
-                    .padding(.vertical, 6)
                 }
             }
-        } label: {
-            Text("By Day").font(.headline)
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxHeight: .infinity)
+    }
+}
+
+// A rounded card with a title, used for every section in Reports
+struct ReportCard<Content: View>: View {
+    let title: String
+    var trailing: String? = nil
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(title).font(.headline)
+                Spacer()
+                if let trailing {
+                    Text(trailing)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            content
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(reportCardBackground, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
+    }
+}
+
+// Small summary card: icon, title, big number, explanation
+struct StatCard: View {
+    let icon: String
+    let color: Color
+    let title: String
+    let value: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(title)
+            } icon: {
+                Image(systemName: icon).foregroundStyle(color)
+            }
+            .font(.callout.weight(.medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            Text(value)
+                .font(.system(size: 28, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(reportCardBackground, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(color.opacity(0.25)))
+    }
+}
+
+// Horizontal bar, full width = 1.0
+struct ProgressBar: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.07))
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(width: max(6, geo.size.width * min(max(fraction, 0), 1)))
+            }
+        }
+        .frame(height: 8)
+    }
+}
+
+// Column titles above the task rows
+struct TaskColumnsHeader: View {
+    let firstTime: String
+    let secondTime: String?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Task").padding(.leading, 30)
+            Spacer()
+            Text("Status").frame(width: 150, alignment: .leading)
+            Text(firstTime).frame(width: 80, alignment: .trailing)
+            if let secondTime {
+                Text(secondTime).frame(width: 70, alignment: .trailing)
+            }
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+}
+
+// One task in Reports; click it to open its card on the right
+struct TaskReportRow: View {
+    let task: TaskItem
+    let firstTime: TimeInterval
+    let secondTime: TimeInterval?
+    let showClient: Bool
+    let selected: Bool
+    var onSelect: () -> Void
+    @State private var hovering = false
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if showClient { parts.append(clientDisplayName(task.client)) }
+        parts.append(task.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale)))
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: task.progressIcon)
+                .font(.system(size: 16))
+                .foregroundStyle(task.progressColor)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.title)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Text(task.progressTitle)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(task.progressColor)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(task.progressColor.opacity(0.14), in: Capsule())
+                .frame(width: 150, alignment: .leading)
+            Text(timeText(firstTime))
+                .monospacedDigit()
+                .foregroundStyle(task.isRunning ? Color.orange : Color.primary)
+                .frame(width: 80, alignment: .trailing)
+            if let secondTime {
+                Text(timeText(secondTime))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 70, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(selected ? Color.accentColor.opacity(0.15)
+                             : (hovering ? Color.primary.opacity(0.05) : Color.clear),
+                    in: RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: onSelect)
+    }
+
+    private func timeText(_ t: TimeInterval) -> String {
+        t >= 60 ? formatDuration(t) : (t > 0 ? "<1m" : "–")
     }
 }
 
@@ -2919,6 +3015,8 @@ struct DayReportRow: View {
     let total: TimeInterval
     let longest: TimeInterval
     let clients: [String: TimeInterval]
+
+    private var isToday: Bool { Calendar.current.isDateInToday(day) }
 
     private var dateText: String {
         day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(appLocale))
@@ -2931,18 +3029,13 @@ struct DayReportRow: View {
             .joined(separator: " · ")
     }
 
-    private var barWidth: CGFloat {
-        CGFloat(max(4, 180 * total / longest))
-    }
-
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(dateText)
-                .frame(width: 110, alignment: .leading)
-            Capsule()
-                .fill(Color.accentColor)
-                .frame(width: barWidth, height: 6)
-                .frame(width: 180, alignment: .leading)
+        HStack(spacing: 12) {
+            Text(isToday ? "Today" : dateText)
+                .fontWeight(isToday ? .semibold : .regular)
+                .frame(width: 100, alignment: .leading)
+            ProgressBar(fraction: total / longest)
+                .frame(width: 200)
             Text(formatDuration(total))
                 .monospacedDigit()
                 .frame(width: 70, alignment: .trailing)
@@ -2950,7 +3043,7 @@ struct DayReportRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            Spacer()
+            Spacer(minLength: 0)
         }
     }
 }
@@ -3027,7 +3120,7 @@ struct TaskoviApp: App {
             ReportsView()
                 .environmentObject(store)
         }
-        .defaultSize(width: 980, height: 640)
+        .defaultSize(width: 1240, height: 780)
         .defaultLaunchBehavior(.suppressed)
     }
 
