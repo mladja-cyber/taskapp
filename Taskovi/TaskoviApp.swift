@@ -202,10 +202,21 @@ struct TaskItem: Identifiable, Codable, Equatable {
         return TaskStage(kind: kind, number: number)
     }
 
-    // The part that starts when a review is approved (none after the hooks: the task is done)
+    var hasHooks: Bool { (stages ?? []).contains { $0.kind == .hooks } }
+
+    // The part that starts when a review is approved. None after the hooks, or after a
+    // body revision when the hooks were already done: then the task is done.
     func approvalStage() -> TaskStage? {
-        guard let last = currentStage, last.kind.isBodyPart else { return nil }
+        guard let last = currentStage, last.kind.isBodyPart, !hasHooks else { return nil }
         return TaskStage(kind: .hooks)
+    }
+
+    // The revision part that reopens a finished task (hooks only if the task had hooks)
+    func reopenStage(hooks: Bool) -> TaskStage? {
+        guard !hooks || hasHooks else { return nil }
+        let kind: StageKind = hooks ? .hooksFix : .bodyFix
+        let number = (stages ?? []).filter { $0.kind == kind }.count + 1
+        return TaskStage(kind: kind, number: number)
     }
 
     // Where the task is now: "Body", "Revision 1 sent", "Done"…
@@ -553,6 +564,18 @@ final class TaskStore: ObservableObject {
         schedule(tasks[i])
     }
 
+    // A finished task needs more work: start a body or hooks revision today, with the timer running
+    func reopen(_ task: TaskItem, hooks: Bool) {
+        guard let i = index(of: task), tasks[i].status == .done,
+              let next = tasks[i].reopenStage(hooks: hooks) else { return }
+        tasks[i].stages = (tasks[i].stages ?? []) + [next]
+        tasks[i].status = .inProgress
+        setDay(at: i, to: todayStart)
+        startTimer(at: i)
+        updateStatus(at: i)
+        schedule(tasks[i])
+    }
+
     // Finish the whole task at once, whatever part it is in
     func markDone(_ task: TaskItem) {
         guard let i = index(of: task), tasks[i].status != .done else { return }
@@ -574,7 +597,8 @@ final class TaskStore: ObservableObject {
         if task.status == .done { return "Reopen Task" }
         if last.state == .sent { return "Undo Send" }
         if stages.count > 1 && task.time(of: last) < Self.undoLimit {
-            return stages[stages.count - 2].state == .revision ? "Undo Revision" : "Undo Approval"
+            if stages[stages.count - 2].state == .revision { return "Undo Revision" }
+            return last.kind == .hooks ? "Undo Approval" : "Undo Reopen"
         }
         return nil
     }
@@ -590,14 +614,18 @@ final class TaskStore: ObservableObject {
             stages[stages.count - 1].state = .working
             stages[stages.count - 1].sentAt = nil
         } else {
-            // Remove the part and the few minutes tracked on it; the previous part waits for review again
+            // Remove the part and the few minutes tracked on it
             stopTimer(at: i)
             let removed = stages.removeLast()
             let sessions = tasks[i].sessions ?? []
             let removedTime = sessions.filter { $0.stageID == removed.id }.reduce(0) { $0 + $1.duration }
             tasks[i].sessions = sessions.filter { $0.stageID != removed.id }
             tasks[i].timeSpent = max(0, (tasks[i].timeSpent ?? 0) - removedTime)
-            stages[stages.count - 1].state = .sent
+            if removed.kind != .hooks && stages[stages.count - 1].state == .approved {
+                tasks[i].status = .done                 // undo a reopen: the task is finished again
+            } else {
+                stages[stages.count - 1].state = .sent  // the previous part waits for review again
+            }
         }
         tasks[i].stages = stages
         updateStatus(at: i)
@@ -1719,7 +1747,14 @@ struct TaskRow: View {
         if task.isAwaitingReview {
             reviewMenuItems
         }
-        if task.status != .done {
+        if task.status == .done {
+            if let body = task.reopenStage(hooks: false) {
+                Button("Body Revision \u{2192} Start \(body.title)") { store.reopen(task, hooks: false) }
+            }
+            if let hooks = task.reopenStage(hooks: true) {
+                Button("Hooks Revision \u{2192} Start \(hooks.title)") { store.reopen(task, hooks: true) }
+            }
+        } else {
             Button("Mark Whole Task as Done") { store.markDone(task) }
         }
         if let undo = store.undoStepTitle(task) {
@@ -2136,7 +2171,35 @@ struct TaskDetailView: View {
     @ViewBuilder
     private func actions(_ task: TaskItem) -> some View {
         if task.status == .done {
-            EmptyView()
+            // Finished, but more work came in: reopen with a revision
+            VStack(alignment: .leading, spacing: 8) {
+                Text("More work on it?")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button {
+                        store.reopen(task, hooks: false)
+                    } label: {
+                        Label("Body Revision", systemImage: "arrow.uturn.backward")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .tint(.orange)
+                    if task.hasHooks {
+                        Button {
+                            store.reopen(task, hooks: true)
+                        } label: {
+                            Label("Hooks Revision", systemImage: "arrow.uturn.backward")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .tint(.purple)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                Text(reopenHint(task))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         } else if task.isAwaitingReview {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Did the review come back?")
@@ -2187,6 +2250,11 @@ struct TaskDetailView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
         }
+    }
+
+    private func reopenHint(_ task: TaskItem) -> String {
+        let parts = [task.reopenStage(hooks: false), task.reopenStage(hooks: true)].compactMap { $0?.title }
+        return "Starts \(parts.joined(separator: " or ")) today, with the timer running"
     }
 
     private func reviewHint(_ task: TaskItem) -> String {
@@ -2550,19 +2618,24 @@ struct SidebarRow: View {
     }
 }
 
+// What the Reports sidebar has selected
+enum ReportsScope: Hashable {
+    case all
+    case client(String)
+}
+
 struct ReportsView: View {
     @EnvironmentObject var store: TaskStore
 
-    private static let allKey = "\u{0}all"
-    @State private var selection: String? = ReportsView.allKey
+    @State private var selection: ReportsScope? = .all
     @State private var month = startOfMonth(Date())
     @State private var search = ""
     @State private var selectedTaskID: UUID?
 
-    // nil = all clients
+    // nil = all clients (also when nothing is selected in the sidebar)
     private var client: String? {
-        guard let selection, selection != Self.allKey else { return nil }
-        return selection
+        if case .client(let name)? = selection { return name }
+        return nil
     }
 
     // Live every second while a timer runs, otherwise once a minute
@@ -2572,10 +2645,10 @@ struct ReportsView: View {
 
     var body: some View {
         NavigationSplitView {
-            TimelineView(.periodic(from: .now, by: refresh)) { context in
-                sidebar(MonthSummary(tasks: store.tasks, month: month, client: nil, now: context.date))
-            }
-            .navigationSplitViewColumnWidth(min: 210, ideal: 240)
+            // Not inside a TimelineView: rebuilding the list every tick breaks clicking in it.
+            // It updates whenever the tasks change.
+            sidebar(MonthSummary(tasks: store.tasks, month: month, client: nil, now: Date()))
+                .navigationSplitViewColumnWidth(min: 210, ideal: 240)
         } detail: {
             TimelineView(.periodic(from: .now, by: refresh)) { context in
                 if search.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -2585,7 +2658,8 @@ struct ReportsView: View {
                         showClients: client == nil,
                         month: $month,
                         selectedTaskID: $selectedTaskID,
-                        selectClient: { selection = $0 })
+                        selectClient: { selection = .client($0) },
+                        showAll: { selection = .all })
                 } else {
                     SearchResultsView(query: search, now: context.date, selectedTaskID: $selectedTaskID)
                 }
@@ -2619,14 +2693,14 @@ struct ReportsView: View {
             Section(month.formatted(.dateTime.month(.wide).year().locale(appLocale))) {
                 SidebarRow(title: "All Clients", icon: "square.grid.2x2",
                            value: all.total > 0 ? formatDuration(all.total) : "–")
-                    .tag(String?.some(Self.allKey))
+                    .tag(ReportsScope?.some(.all))
             }
             Section("Clients") {
                 ForEach(sorted, id: \.self) { name in
                     let t = times[name] ?? 0
                     SidebarRow(title: clientDisplayName(name), icon: nil,
                                value: t > 0 ? formatDuration(t) : "–")
-                        .tag(String?.some(name))
+                        .tag(ReportsScope?.some(.client(name)))
                 }
             }
         }
@@ -2659,6 +2733,7 @@ struct MonthDashboard: View {
     @Binding var month: Date
     @Binding var selectedTaskID: UUID?
     var selectClient: (String) -> Void
+    var showAll: () -> Void
 
     private var isCurrentMonth: Bool {
         Calendar.current.isDate(month, equalTo: Date(), toGranularity: .month)
@@ -2685,9 +2760,17 @@ struct MonthDashboard: View {
     // "All Clients" with the month switcher on the right
     private var header: some View {
         HStack(alignment: .center) {
-            Text(title)
-                .font(.largeTitle.bold())
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                if !showClients {
+                    Button(action: showAll) {
+                        Label("All Clients", systemImage: "chevron.left")
+                    }
+                    .buttonStyle(.link)
+                }
+                Text(title)
+                    .font(.largeTitle.bold())
+                    .lineLimit(1)
+            }
             Spacer()
             HStack(spacing: 6) {
                 if !isCurrentMonth {
